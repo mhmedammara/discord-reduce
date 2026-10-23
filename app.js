@@ -4,9 +4,9 @@ import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 // Must match version.js; bumped together on every release.
-const APP_VERSION = '1.1.20';
+const APP_VERSION = '1.1.21';
 const B = window.DRBudget;
-const { Input, ALL_FORMATS, BlobSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
+const { Input, ALL_FORMATS, BlobSource, BufferSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
 // H.264 plays everywhere in Discord. VP9 is only a fallback for browsers that cannot encode H.264.
 const VIDEO_CODECS = ['avc', 'vp9'];
@@ -188,21 +188,24 @@ async function warmUp(file) {
   } catch {}
 }
 
-async function analyze(file) {
-  await warmUp(file);
+async function analyze(job) {
+  if (job.buffer) return analyzeOnce(job); // the copy in memory cannot fail to read
+  await warmUp(job.file);
   try {
-    return await analyzeOnce(file);
+    return await analyzeOnce(job);
   } catch (e) {
     if (e instanceof FriendlyError && e.code !== 'unreadable') throw e;
     // One more try: a lazily exported file is often readable a moment later.
     await new Promise((r) => setTimeout(r, 700));
-    await warmUp(file);
-    return analyzeOnce(file);
+    await warmUp(job.file);
+    return analyzeOnce(job);
   }
 }
 
-async function analyzeOnce(file) {
-  const input = new Input({ source: new BlobSource(file, { useStreamReader: false }), formats: ALL_FORMATS });
+async function analyzeOnce(job) {
+  const file = job.file; // name, size and date only; the video data comes from the copy when there is one
+  const source = job.buffer ? new BufferSource(job.buffer) : new BlobSource(file, { useStreamReader: false });
+  const input = new Input({ source, formats: ALL_FORMATS });
   try {
     const video = await input.getPrimaryVideoTrack();
     if (!video) throw new FriendlyError('novideo');
@@ -336,10 +339,12 @@ document.addEventListener('drop', (e) => {
 
 // Phones only let the page read a picked video for a short while after it was picked (later videos failed with
 // "The requested file could not be read ... permission problems"). So every picked video, even a single one,
-// is read in full at the instant of the pick, all at once, and only that copy is used afterwards. The copies
-// are Files, which the browser keeps in its own storage (paged to disk when memory is short).
+// is read in full at the instant of the pick, all at once.
+// The copy is kept as plain memory owned by the page (an ArrayBuffer), NOT as a File: a File copy lives in the
+// browser's blob storage, which moves big items to disk while the phone is busy, and reading it back later
+// failed with the very same error even though the copy itself had worked.
 const COPY_FILE_MAX = 1.5e9;
-const COPY_TOTAL_MAX = 3e9;
+const COPY_TOTAL_MAX = Math.min(3e9, (navigator.deviceMemory || 4) * 300e6); // a 4 GB phone: 1.2 GB
 function startCopies(files) {
   let room = COPY_TOTAL_MAX;
   return files.map((f) => {
@@ -347,7 +352,7 @@ function startCopies(files) {
     room -= f.size;
     const t0 = performance.now();
     return f.arrayBuffer().then(
-      (buf) => ({ file: new File([buf], f.name, { type: f.type }), ms: performance.now() - t0 }),
+      (buffer) => ({ buffer, ms: performance.now() - t0 }),
       (error) => ({ error, ms: performance.now() - t0 }),
     );
   });
@@ -360,14 +365,20 @@ async function attachCopies(copies, offset) {
     const r = copies[i] && (await copies[i]);
     if (!r) {
       job.diag = 'Not copied when picked (too big to hold).';
-    } else if (r.file) {
-      job.source = r.file;
-      job.diag = `Copied when picked: ${B.formatBytes(r.file.size)} in ${(r.ms / 1000).toFixed(1)} s.`;
+    } else if (r.buffer) {
+      job.buffer = r.buffer;
+      job.diag = `Copied when picked: ${B.formatBytes(r.buffer.byteLength)} in ${(r.ms / 1000).toFixed(1)} s, kept in memory.`;
     } else {
       job.diag = `Copy when picked failed after ${(r.ms / 1000).toFixed(1)} s: ${r.error && r.error.name}: ${r.error && r.error.message}`;
     }
   }
 }
+
+/** A File made fresh from data held in memory, right when it is needed (sharing, saving, posting, preview). */
+function freshFile(name, type, buffer) {
+  return new File([buffer], name, { type: type || 'video/mp4', lastModified: Date.now() });
+}
+const fileOf = (out) => (out.buffer ? freshFile(out.file.name, out.file.type, out.buffer) : out.file);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -388,9 +399,9 @@ async function runJob(i) {
     console.warn('Video failed, trying once more', e);
     releaseJob(job);
     job.outputs = [];
-    if (!job.source && job.file.size <= COPY_FILE_MAX) {
+    if (!job.buffer && job.file.size <= COPY_FILE_MAX) {
       try {
-        job.source = new File([await job.file.arrayBuffer()], job.file.name, { type: job.file.type });
+        job.buffer = await job.file.arrayBuffer();
       } catch {}
     }
     setWorking('Trying that video again…', 'One moment.', jobs.length > 1 ? `Video ${i + 1} of ${jobs.length}` : '');
@@ -435,7 +446,7 @@ async function onFiles(picked) {
       }
       releaseJob(jobs[i]);
       // Give the memory back as soon as a video is finished (unless the copy itself is the result).
-      if (jobs[i].source && !jobs[i].outputs.some((o) => o.file === jobs[i].source)) jobs[i].source = null;
+      if (jobs[i].buffer && !jobs[i].outputs.some((o) => o.buffer === jobs[i].buffer)) jobs[i].buffer = null;
       if (i < jobs.length - 1) {
         // Give the phone a moment to free what this video used before the next one starts.
         setWorking('Getting ready for the next video…', 'One moment.', `Video ${i + 2} of ${jobs.length}`);
@@ -462,12 +473,12 @@ async function processJob(job, index, total) {
   const queue = total > 1 ? `Video ${index + 1} of ${total}` : '';
   setWorking('Reading your video…', 'This only takes a moment.', queue);
   show('work');
-  job.info = await analyze(job.source || job.file);
+  job.info = await analyze(job);
   if (cancelled) throw new Cancelled();
   const info = job.info;
 
   if (B.fitsAlready(job.file.size, limitMB()) && !el.trimFirst.checked) {
-    job.outputs = [{ file: job.source || job.file, original: true, bytes: job.file.size, durationText: B.formatDuration(info.duration), plan: null, part: null }];
+    job.outputs = [{ file: job.buffer ? freshFile(job.file.name, job.file.type, job.buffer) : job.file, buffer: job.buffer || null, original: true, bytes: job.file.size, durationText: B.formatDuration(info.duration), plan: null, part: null }];
     return;
   }
 
@@ -546,7 +557,7 @@ function askTrim(job, reason, queue) {
   const info = job.info;
   const limit = limitMB();
   el.trimQueue.textContent = queue;
-  el.trimVideo.src = objectUrl(job.source || job.file);
+  el.trimVideo.src = objectUrl(job.buffer ? freshFile(job.file.name, job.file.type, job.buffer) : job.file);
   for (const r of [el.trimStart, el.trimEnd]) {
     r.max = info.duration;
     r.step = info.duration > 30 ? 0.5 : 0.1;
@@ -745,6 +756,7 @@ async function encodeSegment(job, seg, part, queue) {
       const file = new File([out.buffer], outputName(info.file.name, part), { type: 'video/mp4', lastModified: Date.now() });
       return {
         file,
+        buffer: out.buffer,
         original: false,
         bytes: file.size,
         plan: attemptPlan,
@@ -792,7 +804,7 @@ function addCard(job, out) {
   video.controls = true;
   video.playsInline = true;
   video.preload = 'metadata';
-  video.src = objectUrl(out.file);
+  video.src = objectUrl(fileOf(out));
   const status = document.createElement('p');
   status.className = 'small status';
   status.hidden = true;
@@ -916,7 +928,7 @@ el.postBtn.addEventListener('click', async () => {
       await postToThread({
         hook,
         username: name,
-        file: out.file,
+        file: fileOf(out),
         onProgress: (p) => setStatus(out, `Posting… ${Math.round(p * 100)}%`),
       });
       out.posted = true;
@@ -949,7 +961,7 @@ function nextShareBatch() {
   for (let i = shareNext; i < items.length && batch.length < SHARE_MAX_FILES; i++) {
     const size = items[i].out.file.size;
     if (batch.length && bytes + size > SHARE_MAX_BYTES) break;
-    batch.push(items[i].out.file);
+    batch.push(fileOf(items[i].out));
     bytes += size;
   }
   try {
@@ -1006,7 +1018,7 @@ el.shareBtn.addEventListener('click', async () => {
 el.saveBtn.addEventListener('click', async () => {
   for (const { out } of flat()) {
     const a = document.createElement('a');
-    a.href = objectUrl(out.file);
+    a.href = objectUrl(fileOf(out));
     a.download = out.file.name;
     document.body.append(a);
     a.click();

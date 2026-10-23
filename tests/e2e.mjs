@@ -860,6 +860,53 @@ await test('a stale version file never mixes with new code: the page reloads onc
   }
 });
 
+await test("like the user's phone: originals expire 1.5 s after the pick AND page-made copies can't be read back after 3 s", async () => {
+  // Reproduces the real report: "Copied when picked: 72.5 MB in 6.9 s." followed by "The requested file could
+  // not be read ..." when that copy was read later (the browser had moved it out of memory).
+  const { ctx, page } = await newPage({
+    init: () => {
+      const msg = 'The requested file could not be read, typically due to permission problems that have occurred after a reference to a file was acquired.';
+      let tPick = 0;
+      document.addEventListener('change', (e) => { if (e.target.id === 'file') tPick = Date.now(); }, true);
+      const t0 = Date.now();
+      const NativeFile = window.File;
+      window.File = class extends NativeFile {
+        constructor(...a) {
+          super(...a);
+          this.__born = Date.now();
+        }
+      };
+      const bad = (b) =>
+        (b.__born && b.size > 1e6 && Date.now() - b.__born > 3000) || // a page-made copy, read back later
+        (!b.__born && tPick && b.lastModified < t0 - 1000 && Date.now() - tPick > 1500); // an original, read late
+      const err = () => new DOMException(msg, 'NotReadableError');
+      const slice = Blob.prototype.slice;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (this.__born) part.__born = this.__born;
+        if (bad(this)) {
+          part.arrayBuffer = () => Promise.reject(err());
+          part.stream = () => new ReadableStream({ start: (c) => c.error(err()) });
+        }
+        return part;
+      };
+      const ab = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        return bad(this) ? Promise.reject(err()) : ab.call(this);
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .status.err').count(), 0, await page.textContent('#results'));
+  assert.equal(await page.locator('#results .item video').count(), 2);
+  await page.waitForTimeout(3500); // let every page-made File get "old"
+  const files = await saveAll(page, 2, 'out-phone');
+  checkShrunk(files.find((f) => /landscape/.test(f.name)).out, { limitMB: 10, duration: 25, audio: true });
+  checkShrunk(files.find((f) => /noaudio/.test(f.name)).out, { limitMB: 10, duration: 20, audio: false });
+  await ctx.close();
+});
+
 await browser.close();
 server.close();
 const failed = results.filter((r) => !r[1]);
