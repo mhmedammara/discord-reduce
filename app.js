@@ -567,6 +567,20 @@ async function encodeOnce(info, plan, trim, onProgress, probe = false) {
   return { buffer: output.target.buffer, videoCodec };
 }
 
+/** A failed pass is retried once after a moment: the phone's hardware encoder/decoder may still be freeing up. */
+async function encodeWithRetry(info, plan, trim, onProgress, probe = false) {
+  try {
+    return await encodeOnce(info, plan, trim, onProgress, probe);
+  } catch (e) {
+    if (e instanceof Cancelled || e instanceof FriendlyError) throw e;
+    perf(`Encoding failed (${(e && e.message) || e}); trying once more`);
+    console.warn('Encoding failed, retrying once', e);
+    await new Promise((r) => setTimeout(r, 1500));
+    if (cancelled) throw new Cancelled();
+    return encodeOnce(info, plan, trim, onProgress, probe);
+  }
+}
+
 function progressReporter() {
   const started = performance.now();
   return (p) => {
@@ -593,7 +607,7 @@ async function encodeSegment(job, seg, part, queue) {
     const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
     try {
       const tProbe = performance.now();
-      const probed = await encodeOnce(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
+      const probed = await encodeWithRetry(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
       const measured = (probed.buffer.byteLength * 8) / PROBE_SECONDS;
       const before = videoBps;
       videoBps = B.calibrate(videoBps, measured);
@@ -613,7 +627,7 @@ async function encodeSegment(job, seg, part, queue) {
       label,
     );
     const tPass = performance.now();
-    const out = await encodeOnce(info, attemptPlan, seg, progressReporter());
+    const out = await encodeWithRetry(info, attemptPlan, seg, progressReporter());
     const passSecs = (performance.now() - tPass) / 1000;
     perf(`Pass ${attempt}${part ? ` (part ${part.index}/${part.count})` : ''}: ${layout.width}x${layout.height} @${layout.fps} fps, asked ${Math.round(videoBps / 1000)} kbps; took ${passSecs.toFixed(1)} s for ${B.formatDuration(length)} of video (${(length / passSecs).toFixed(1)}x realtime); result ${B.formatBytes(out.buffer.byteLength)} ${out.buffer.byteLength <= plan.acceptBytes ? 'fits' : 'TOO BIG, redoing'}`);
     if (out.buffer.byteLength <= plan.acceptBytes) {
@@ -667,7 +681,7 @@ function addCard(job, out) {
   const video = document.createElement('video');
   video.controls = true;
   video.playsInline = true;
-  video.preload = 'metadata';
+  video.preload = 'none'; // do not hold one of the phone's few hardware decoders until someone presses play
   video.src = objectUrl(out.file);
   const status = document.createElement('p');
   status.className = 'small status';
