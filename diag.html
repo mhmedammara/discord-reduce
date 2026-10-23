@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Phone check</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<meta name="referrer" content="no-referrer">
+<script>if (window.top !== window.self) { try { window.top.location.replace(window.self.location.href); } catch (e) {} document.documentElement.hidden = true; }</script>
+<meta name="color-scheme" content="dark light">
+<script type="importmap">{"imports":{"mediabunny":"./vendor/mediabunny.min.mjs"}}</script>
+<style>
+  :root { --bg:#1e1f22; --card:#2b2d31; --line:#3f4147; --text:#f2f3f5; --muted:#b5bac1; --primary:#5865f2; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f2f3f5; --card:#fff; --line:#d7d9dd; --text:#1e1f22; --muted:#5c5f66; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:17px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:24px max(16px,env(safe-area-inset-right)) 40px max(16px,env(safe-area-inset-left)); display:flex; justify-content:center; }
+  main { width:100%; max-width:560px; display:flex; flex-direction:column; gap:14px; }
+  h1 { font-size:26px; margin:0; } p { margin:0; } .muted { color:var(--muted); } .small { font-size:14px; }
+  .btn { appearance:none; border:1px solid var(--line); background:var(--card); color:var(--text); font:inherit; font-weight:700; min-height:52px; padding:10px 16px; border-radius:12px; cursor:pointer; width:100%; display:flex; align-items:center; justify-content:center; text-align:center; }
+  .btn.primary { background:var(--primary); border-color:var(--primary); color:#fff; }
+  .btn[disabled] { opacity:.6; }
+  pre { margin:0; padding:12px; background:var(--card); border:1px solid var(--line); border-radius:12px; white-space:pre-wrap; word-break:break-word; font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; min-height:120px; }
+  .vh { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Phone check</h1>
+  <p class="muted">This tests whether your phone can shrink videos and shows what it supports. It doesn't upload anything. When it finishes, tap <b>Copy report</b> and paste it to whoever asked you to run it.</p>
+  <button class="btn primary" id="run" type="button">Run the check</button>
+  <pre id="report" aria-live="polite">Not run yet.</pre>
+  <button class="btn" id="copy" type="button" hidden>Copy report</button>
+  <input id="file" class="vh" type="file" accept="video/*">
+  <label for="file" class="btn" id="inspect" hidden>Also inspect one of my videos</label>
+</main>
+
+<script type="module">
+  import * as MB from 'mediabunny';
+
+  const $ = (id) => document.getElementById(id);
+  const lines = [];
+  const add = (k, v) => lines.push(v === undefined ? k : `${k}: ${v}`);
+  const render = () => ($('report').textContent = lines.join('\n'));
+  const yn = (v) => (v ? 'yes' : 'NO');
+
+  async function check(name, fn) {
+    try { add(name, await fn()); } catch (e) { add(name, 'ERROR ' + (e && e.message || e)); }
+    render();
+  }
+  const enc = async (cfg) => { const r = await VideoEncoder.isConfigSupported({ framerate: 30, ...cfg }); return yn(r.supported); };
+  const dec = async (codec) => yn((await VideoDecoder.isConfigSupported({ codec })).supported);
+
+  async function selfTest() {
+    const codec = await MB.getFirstEncodableVideoCodec(['avc', 'vp9'], { width: 1280, height: 720, bitrate: 2e6 });
+    if (!codec) return 'no encodable video codec';
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280; canvas.height = 720;
+    const ctx = canvas.getContext('2d');
+    const output = new MB.Output({ format: new MB.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new MB.BufferTarget() });
+    const source = new MB.CanvasSource(canvas, { codec, bitrate: 2e6 });
+    output.addVideoTrack(source);
+    const t0 = performance.now();
+    await output.start();
+    const frames = 90;
+    for (let i = 0; i < frames; i++) {
+      ctx.fillStyle = `hsl(${(i * 4) % 360} 70% 50%)`;
+      ctx.fillRect(0, 0, 1280, 720);
+      ctx.fillStyle = '#fff';
+      ctx.fillRect((i * 13) % 1200, 300, 80, 120);
+      await source.add(i / 30, 1 / 30);
+    }
+    source.close();
+    await output.finalize();
+    const secs = (performance.now() - t0) / 1000;
+    return `${codec}, ${frames} frames of 720p in ${secs.toFixed(1)} s (${(frames / secs).toFixed(0)} fps), ${(output.target.buffer.byteLength / 1e3).toFixed(0)} KB`;
+  }
+
+  async function run() {
+    lines.length = 0;
+    $('run').disabled = true;
+    add('Shrink for Discord phone check');
+    add('Version', window.DR_VERSION || '(see index page footer)');
+    add('Time', new Date().toISOString());
+    add('Browser', navigator.userAgent);
+    add('Platform', `${navigator.platform}, touch points ${navigator.maxTouchPoints}, cores ${navigator.hardwareConcurrency ?? '?'}, memory ${navigator.deviceMemory ?? 'n/a'} GB`);
+    add('Screen', `${screen.width}x${screen.height} @${devicePixelRatio}x`);
+    add('Secure page', yn(isSecureContext));
+    add('');
+    add('-- Video encoding (WebCodecs)');
+    add('VideoEncoder present', yn('VideoEncoder' in window));
+    add('VideoDecoder present', yn('VideoDecoder' in window));
+    render();
+    if ('VideoEncoder' in window) {
+      await check('H.264 encode 720p', () => enc({ codec: 'avc1.64001f', width: 1280, height: 720, bitrate: 2e6 }));
+      await check('H.264 encode 1080p', () => enc({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 4e6 }));
+      await check('H.264 encode 1080p (baseline)', () => enc({ codec: 'avc1.42002a', width: 1920, height: 1080, bitrate: 4e6 }));
+      await check('VP9 encode 720p', () => enc({ codec: 'vp09.00.31.08', width: 1280, height: 720, bitrate: 2e6 }));
+    }
+    if ('VideoDecoder' in window) {
+      await check('H.264 decode', () => dec('avc1.640028'));
+      await check('HEVC decode (iPhone default)', () => dec('hvc1.1.6.L93.B0'));
+      await check('HEVC 10-bit decode (iPhone HDR)', () => dec('hvc1.2.4.L123.B0'));
+    }
+    add('');
+    add('-- Sound');
+    add('AudioEncoder present', yn('AudioEncoder' in window));
+    if ('AudioEncoder' in window) await check('AAC encode (built in)', async () => yn((await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 128000 })).supported));
+    if ('AudioDecoder' in window) await check('AAC decode', async () => yn((await AudioDecoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2 })).supported));
+    await check('Bundled AAC encoder loads', async () => { const m = await import('./vendor/mediabunny-aac-encoder.min.mjs'); return yn(typeof m.registerAacEncoder === 'function'); });
+    add('');
+    add('-- Sharing and staying awake');
+    await check('Share files', () => {
+      const f = new File([new Uint8Array(4)], 'a.mp4', { type: 'video/mp4' });
+      return `share ${yn(!!navigator.share)}, canShare(files) ${yn(!!(navigator.canShare && navigator.canShare({ files: [f] })))}`;
+    });
+    add('Screen wake lock', yn('wakeLock' in navigator));
+    add('Clipboard', yn(!!(navigator.clipboard && navigator.clipboard.writeText)));
+    await check('Saved settings work', () => { localStorage.setItem('dr-diag', '1'); localStorage.removeItem('dr-diag'); return 'yes'; });
+    add('Offline support', yn('serviceWorker' in navigator));
+    add('');
+    add('-- Real test: encode 3 seconds of video');
+    render();
+    await check('Result', selfTest);
+    add('');
+    add('Done.');
+    render();
+    $('run').disabled = false;
+    $('run').textContent = 'Run again';
+    $('copy').hidden = false;
+    $('inspect').hidden = false;
+  }
+
+  async function inspect(file) {
+    add('');
+    add(`-- Your video: ${file.name}`);
+    render();
+    const input = new MB.Input({ source: new MB.BlobSource(file), formats: MB.ALL_FORMATS });
+    try {
+      add('Size', `${(file.size / 1e6).toFixed(1)} MB, type "${file.type}", last modified ${new Date(file.lastModified).toISOString()}`);
+      await check('Container', async () => (await input.getFormat()).name);
+      const v = await input.getPrimaryVideoTrack();
+      if (!v) { add('Video', 'none found'); }
+      else {
+        await check('Video', async () => `${await v.getCodec()} ${await v.getDisplayWidth()}x${await v.getDisplayHeight()}, rotation ${await v.getRotation()}, can decode ${yn(await v.canDecode())}`);
+        await check('Frame rate', async () => (await v.computePacketStats(150)).averagePacketRate.toFixed(1) + ' fps');
+        await check('Color', async () => `HDR ${yn(await v.hasHighDynamicRange())}, ${JSON.stringify(await v.getColorSpace())}`);
+      }
+      const a = await input.getPrimaryAudioTrack();
+      if (!a) add('Audio', 'none found');
+      else await check('Audio', async () => `${await a.getCodec()}, ${await a.getNumberOfChannels()} ch, ${await a.getSampleRate()} Hz, ${Math.round(((await a.getAverageBitrate()) || 0) / 1000)} kbps, can decode ${yn(await a.canDecode())}`);
+      await check('Duration', async () => (await input.computeDuration()).toFixed(1) + ' s');
+      await check('Metadata', async () => {
+        const t = await input.getMetadataTags();
+        const keys = Object.keys(t.raw || {});
+        return `recorded ${t.date ? new Date(t.date).toISOString() : 'not found'}; other tags: ${keys.length ? keys.join(', ') : 'none'} (values not shown)`;
+      });
+    } finally { input.dispose(); }
+    render();
+  }
+
+  $('run').addEventListener('click', run);
+  $('copy').addEventListener('click', async () => {
+    const text = lines.join('\n');
+    try { await navigator.clipboard.writeText(text); }
+    catch { const r = document.createRange(); r.selectNodeContents($('report')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand('copy'); }
+    $('copy').textContent = 'Copied ✓';
+    setTimeout(() => ($('copy').textContent = 'Copy report'), 1800);
+  });
+  $('file').addEventListener('change', () => { const f = $('file').files[0]; if (f) inspect(f); });
+</script>
+<script src="version.js"></script>
+</body>
+</html>

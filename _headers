@@ -1,0 +1,7 @@
+# Used by Cloudflare Pages and Netlify (GitHub Pages ignores this file; index.html carries a smaller CSP of its own).
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  X-Frame-Options: DENY
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()
+  Content-Security-Policy: connect-src 'self' https://discord.com https://ptb.discord.com https://canary.discord.com https://discordapp.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'

@@ -96,3 +96,44 @@ test('formatters', () => {
   assert.equal(B.formatDuration(75), '1:15');
   assert.equal(B.formatDuration(3725), '1:02:05');
 });
+
+test('concert mode gives the sound a bigger share', () => {
+  const src = { codec: 'opus', bitrate: 192000, channels: 2 };
+  const normal = B.plan({ duration: 45, limitMB: 20, ...phone1080, audio: src });
+  const concert = B.plan({ duration: 45, limitMB: 20, ...phone1080, audio: src, concert: true });
+  assert.equal(normal.audio.bitrate, 96000);
+  assert.equal(concert.audio.bitrate, 128000);
+  assert.equal(concert.audio.channels, 2);
+  assert.ok(concert.videoBitrate < normal.videoBitrate);
+  const tight = B.plan({ duration: 400, limitMB: 10, ...phone1080, audio: src, concert: true });
+  assert.ok(tight.audio.bitrate <= 64000);
+});
+
+test('split length: about 1 min at 10 MB and 2 min at 20 MB', () => {
+  assert.equal(B.splitLength(10, true), 60);
+  assert.equal(B.splitLength(20, true), 120);
+  assert.ok(B.splitLength(50, true) >= 300);
+});
+
+test('splitting makes equal parts that cover the clip exactly', () => {
+  assert.deepEqual(B.splitParts(0, 50, 10, true), [{ start: 0, end: 50 }]);
+  const parts = B.splitParts(0, 190, 20, true);
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].start, 0);
+  assert.equal(parts[1].end, 190);
+  assert.equal(parts[0].end, parts[1].start);
+  for (const p of B.splitParts(10, 400, 10, true)) assert.ok(p.end - p.start <= 60.1);
+  const trimmed = B.splitParts(30, 150, 10, true);
+  assert.equal(trimmed[0].start, 30);
+  assert.equal(trimmed.at(-1).end, 150);
+});
+
+test('calibration corrects overshoot fully and undershoot cautiously', () => {
+  const planned = 1_000_000;
+  assert.ok(B.calibrate(planned, 1_250_000) < planned * 0.82);
+  assert.ok(B.calibrate(planned, 1_000_000) <= planned);
+  const up = B.calibrate(planned, 700_000);
+  assert.ok(up > planned && up < planned / 0.7);
+  assert.ok(B.calibrate(planned, 100_000) <= planned * 1.35);
+  assert.equal(B.calibrate(planned, 0), planned);
+});

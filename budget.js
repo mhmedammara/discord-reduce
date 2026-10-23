@@ -44,9 +44,12 @@
    * srcAudio: null | { codec, bitrate, channels }. Returns null for "no audio".
    * `copy` means the source AAC can be passed through untouched.
    */
-  function planAudio(totalBps, srcAudio, noCopy = false) {
+  function planAudio(totalBps, srcAudio, noCopy = false, concert = false) {
     if (!srcAudio) return null;
-    const tier = totalBps >= 1.2e6 ? 96000 : totalBps >= 6e5 ? 64000 : 40000;
+    // Concert mode keeps the sound sharp: music is the point, so it gets a bigger slice of the budget.
+    const tier = concert
+      ? totalBps >= 1.2e6 ? 128000 : totalBps >= 6e5 ? 96000 : totalBps >= 3e5 ? 64000 : 40000
+      : totalBps >= 1.2e6 ? 96000 : totalBps >= 6e5 ? 64000 : 40000;
     const srcChannels = srcAudio.channels || 2;
     const channels = tier <= 40000 ? 1 : Math.min(2, srcChannels);
     const srcBitrate = srcAudio.bitrate || 0;
@@ -105,13 +108,14 @@
   /**
    * Full plan for one video.
    * opts: { duration (s), limitMB, width, height, fps, audio: null | {codec,bitrate,channels},
-   *          noCopy?: true when the audio has to be re-encoded anyway (e.g. trimmed from a later start) }
+   *          noCopy?: true when the audio has to be re-encoded anyway (e.g. trimmed from a later start),
+   *          concert?: true to give the sound a bigger share }
    */
   function plan(opts) {
     const duration = Math.max(0.1, opts.duration);
     const target = targetBytes(opts.limitMB);
     const totalBps = (target * 8) / duration;
-    const audio = planAudio(totalBps, opts.audio, opts.noCopy);
+    const audio = planAudio(totalBps, opts.audio, opts.noCopy, opts.concert);
     const audioBps = audio ? audio.bitrate : 0;
     const videoBps = Math.max(20000, Math.floor((totalBps - audioBps) * FIRST_PASS));
     return {
@@ -130,10 +134,44 @@
   }
 
   /** Longest clip (seconds) that still gets a 'good' picture at this limit, even at the smallest size. */
-  function maxGoodSeconds(limitMB, hasAudio = true) {
-    const audioBps = hasAudio ? 40000 : 0;
+  function maxGoodSeconds(limitMB, hasAudio = true, concert = false) {
+    const audioBps = hasAudio ? (concert ? 64000 : 40000) : 0;
     const videoBpsNeeded = BPP_GOOD * 426 * 240 * 30; // 240p at 30 fps
     return Math.floor((targetBytes(limitMB) * 8) / ((videoBpsNeeded + audioBps) / FIRST_PASS));
+  }
+
+  /** Seconds per part when a long clip is split: each part gets a good 540p picture. Multiple of 15 s. */
+  function splitLength(limitMB, concert = false) {
+    const audioBps = concert ? 128000 : 96000;
+    const videoBpsNeeded = BPP_GOOD * 960 * 540 * 30; // 540p at 30 fps
+    const secs = (targetBytes(limitMB) * 8) / (videoBpsNeeded / FIRST_PASS + audioBps);
+    return Math.max(15, Math.floor(secs / 15) * 15);
+  }
+
+  /** Split [start, end] into the fewest roughly equal parts no longer than splitLength. */
+  function splitParts(start, end, limitMB, concert = false) {
+    const total = end - start;
+    const n = Math.max(1, Math.ceil(total / splitLength(limitMB, concert) - 1e-9));
+    const parts = [];
+    for (let i = 0; i < n; i++) {
+      parts.push({
+        start: Math.round((start + (total * i) / n) * 10) / 10,
+        end: i === n - 1 ? end : Math.round((start + (total * (i + 1)) / n) * 10) / 10,
+      });
+    }
+    return parts;
+  }
+
+  /**
+   * Correct a planned video bitrate after encoding a short sample: measuredBps is what the encoder actually
+   * produced. Overshoots are corrected fully; undershoots only partly, because a quiet sample may be easier
+   * than the rest of the clip.
+   */
+  function calibrate(plannedBps, measuredBps) {
+    if (!(measuredBps > 0)) return plannedBps;
+    const r = Math.min(1.6, Math.max(0.5, measuredBps / plannedBps));
+    const next = r > 1 ? (plannedBps / r) * 0.98 : plannedBps * Math.min(1.35, 1 + (1 / r - 1) * 0.6);
+    return Math.max(20000, Math.floor(next));
   }
 
   function formatBytes(n) {
@@ -161,6 +199,9 @@
     plan,
     retryVideoBitrate,
     maxGoodSeconds,
+    splitLength,
+    splitParts,
+    calibrate,
     formatBytes,
     formatDuration,
   };

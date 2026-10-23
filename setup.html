@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Set up the thread link</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'self' https://discord.com https://ptb.discord.com https://canary.discord.com https://discordapp.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<meta name="referrer" content="no-referrer">
+<script>if (window.top !== window.self) { try { window.top.location.replace(window.self.location.href); } catch (e) {} document.documentElement.hidden = true; }</script>
+<meta name="color-scheme" content="dark light">
+<style>
+  :root { --bg:#1e1f22; --card:#2b2d31; --line:#3f4147; --text:#f2f3f5; --muted:#b5bac1; --primary:#5865f2; --good:#3ba55d; --bad:#f23f43; }
+  @media (prefers-color-scheme: light) { :root { --bg:#f2f3f5; --card:#fff; --line:#d7d9dd; --text:#1e1f22; --muted:#5c5f66; --bad:#d83c3e; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:17px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; padding:24px max(16px,env(safe-area-inset-right)) 40px max(16px,env(safe-area-inset-left)); display:flex; justify-content:center; }
+  main { width:100%; max-width:560px; display:flex; flex-direction:column; gap:16px; }
+  h1 { font-size:26px; margin:0; } p { margin:0; } ol { margin:0; padding-left:22px; display:flex; flex-direction:column; gap:6px; }
+  .muted { color:var(--muted); } .small { font-size:14px; }
+  .field { display:flex; flex-direction:column; gap:6px; } label { font-weight:600; }
+  input { font:inherit; font-size:16px; color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:12px; min-height:48px; padding:8px 12px; width:100%; }
+  .btn { appearance:none; border:1px solid var(--line); background:var(--card); color:var(--text); font:inherit; font-weight:700; min-height:48px; padding:10px 16px; border-radius:12px; cursor:pointer; width:100%; }
+  .btn.primary { background:var(--primary); border-color:var(--primary); color:#fff; }
+  .btn[disabled] { opacity:.6; cursor:default; }
+  .notice { border-left:4px solid #f0b232; background:var(--card); border-radius:8px; padding:10px 12px; }
+  .ok { color:var(--good); } .err { color:var(--bad); }
+  [hidden] { display:none !important; }
+  code { font-size:.9em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Set up the thread link</h1>
+  <p class="muted">For the person who runs the server. This makes one link; anyone who opens it can post their shrunk videos straight into your thread.</p>
+
+  <ol>
+    <li>In Discord (on a computer): <b>Server Settings → Integrations → Webhooks → New Webhook</b>.</li>
+    <li>Choose the channel your thread is in, then <b>Copy Webhook URL</b>.</li>
+    <li>Paste it below, along with the link to your thread (long-press or right-click the thread → <b>Copy Link</b>).</li>
+  </ol>
+
+  <div class="field">
+    <label for="url">Webhook URL</label>
+    <input id="url" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://discord.com/api/webhooks/…">
+  </div>
+  <div class="field">
+    <label for="thread">Thread link (or thread ID)</label>
+    <input id="thread" type="text" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://discord.com/channels/…">
+  </div>
+  <p id="problem" class="err small" hidden></p>
+
+  <button class="btn primary" id="make" type="button">Make the link</button>
+
+  <section id="result" class="field" hidden>
+    <label for="link">Link to share with your friends</label>
+    <input id="link" type="text" readonly>
+    <p class="small">Thread label: <b id="label"></b>. Tell your friends the link should end with this when they connect, so they can tell it's yours.</p>
+    <button class="btn" id="copy" type="button">Copy link</button>
+    <button class="btn" id="test" type="button">Send a test message to the thread</button>
+    <p id="testStatus" class="small" aria-live="polite"></p>
+    <p class="notice small">Treat this link like a password. Anyone who has it can post to the thread (and nothing else). If it leaks, delete the webhook in Discord and make a new link here.</p>
+    <p class="muted small">Nothing you paste here is stored or sent anywhere except to Discord when you press the test button.</p>
+  </section>
+</main>
+
+<script type="module">
+  import { encodeHook, decodeHook, parseThreadId, isWebhookUrl, postToThread, describeHook, POST_MESSAGES } from './discord.mjs';
+
+  const $ = (id) => document.getElementById(id);
+  let hook = null;
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+    const warn = $('problem');
+    warn.hidden = false;
+    warn.textContent = 'Open this page from your website address (https://…), or the link it makes will not work for your friends.';
+  }
+
+  $('make').addEventListener('click', () => {
+    const url = $('url').value.trim().split('?')[0];
+    const threadId = parseThreadId($('thread').value);
+    const problem = $('problem');
+    problem.hidden = false;
+    if (!isWebhookUrl(url)) {
+      problem.textContent = 'That doesn\'t look like a webhook URL. It should start with https://discord.com/api/webhooks/ and be followed by two long codes.';
+      return;
+    }
+    if (!threadId) {
+      problem.textContent = 'I couldn\'t find the thread. Paste the thread link (it ends with a long number) or just the number.';
+      return;
+    }
+    problem.hidden = true;
+    const encoded = encodeHook({ url, threadId });
+    hook = decodeHook(encoded);
+    $('link').value = new URL('index.html', location.href).href.replace(/index\.html$/, '') + '#hook=' + encoded;
+    $('label').textContent = describeHook(hook);
+    $('result').hidden = false;
+    $('testStatus').textContent = '';
+    $('link').select();
+  });
+
+  $('copy').addEventListener('click', async () => {
+    const link = $('link');
+    link.select();
+    try { await navigator.clipboard.writeText(link.value); } catch { document.execCommand('copy'); }
+    $('copy').textContent = 'Copied ✓';
+    setTimeout(() => ($('copy').textContent = 'Copy link'), 1800);
+  });
+
+  $('test').addEventListener('click', async () => {
+    const status = $('testStatus');
+    status.className = 'small';
+    status.textContent = 'Sending…';
+    $('test').disabled = true;
+    try {
+      await postToThread({ hook, username: 'Shrink setup', content: '✅ The thread link works. Videos shrunk with the tool will appear here.' });
+      status.className = 'small ok';
+      status.textContent = 'Sent! Check the thread for the test message.';
+    } catch (e) {
+      status.className = 'small err';
+      status.textContent = e.code === 'rejected' && e.status === 400
+        ? 'Discord rejected it (is that link for a thread, and is the thread still open?).'
+        : (POST_MESSAGES[e.code] || 'That didn\'t work.') + (e.code === 'unconfirmed' ? ' (Your browser may be blocking the request.)' : '');
+    } finally {
+      $('test').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

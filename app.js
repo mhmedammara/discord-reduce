@@ -1,49 +1,32 @@
-// discord-reduce: shrink a video on-device so it fits Discord's upload limit.
+// discord-reduce: shrink videos on-device so they fit Discord's upload limit, then post or share them.
 // Decode -> resize -> hardware encode -> MP4, all in the browser via WebCodecs (mediabunny).
 import * as MB from 'mediabunny';
+import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 const B = window.DRBudget;
+const C = window.DRCaption;
 const { Input, ALL_FORMATS, BlobSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
 // H.264 plays everywhere in Discord. VP9 is only a fallback for browsers that cannot encode H.264.
 const VIDEO_CODECS = ['avc', 'vp9'];
 const MAX_ATTEMPTS = 3;
+const PROBE_SECONDS = 4; // length of the sample used to check how the encoder behaves
+const PROBE_MIN_CLIP = 12; // shorter clips are just encoded, which is quick enough
+const SOFT_BELOW = 480; // asking about trim/split when the picture would drop below this height
 
 const $ = (id) => document.getElementById(id);
-const el = {
-  file: $('file'),
-  limit: $('limit'),
-  trimFirst: $('trimFirst'),
-  trimVideo: $('trimVideo'),
-  trimInfo: $('trimInfo'),
-  trimStart: $('trimStart'),
-  trimEnd: $('trimEnd'),
-  trimStartLabel: $('trimStartLabel'),
-  trimEndLabel: $('trimEndLabel'),
-  trimSummary: $('trimSummary'),
-  trimGo: $('trimGo'),
-  trimBack: $('trimBack'),
-  workTitle: $('workTitle'),
-  workStatus: $('workStatus'),
-  bar: $('bar'),
-  pct: $('pct'),
-  eta: $('eta'),
-  cancelBtn: $('cancelBtn'),
-  doneTitle: $('doneTitle'),
-  doneSizes: $('doneSizes'),
-  doneDetail: $('doneDetail'),
-  doneVideo: $('doneVideo'),
-  doneNote: $('doneNote'),
-  shareBtn: $('shareBtn'),
-  shareTip: $('shareTip'),
-  saveBtn: $('saveBtn'),
-  againBtn: $('againBtn'),
-  errTitle: $('errTitle'),
-  errMsg: $('errMsg'),
-  errDetail: $('errDetail'),
-  errBack: $('errBack'),
-  unsupportedMsg: $('unsupportedMsg'),
-};
+const el = Object.fromEntries(
+  [
+    'file', 'limit', 'concert', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
+    'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
+    'trimGo', 'trimSplit', 'trimBack',
+    'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
+    'doneTitle', 'doneSizes', 'results', 'doneNote',
+    'capEdit', 'capEvent', 'capVenue', 'capDate', 'capNote', 'capPreview', 'copyCaption',
+    'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
+    'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
+  ].map((id) => [id, $(id)]),
+);
 
 const MESSAGES = {
   unreadable: ["We couldn't read that video", 'Try picking it again from your camera roll or gallery.'],
@@ -53,10 +36,8 @@ const MESSAGES = {
     'Try Safari on iPhone or Chrome on Android. If the video came from another app, save it to your camera roll first.',
   ],
   cantEncode: ["This browser can't shrink videos", 'On iPhone use Safari (iOS 16.4 or newer). On Android use Chrome.'],
-  generic: [
-    'Something went wrong',
-    'Try again. If it keeps happening, try a shorter clip or close other apps to free up memory.',
-  ],
+  toobig: ["Couldn't get it small enough", 'Even after squeezing, this video is still over the limit. Try a shorter clip.'],
+  generic: ['Something went wrong', 'Try again. If it keeps happening, try a shorter clip or close other apps to free up memory.'],
 };
 
 class FriendlyError extends Error {
@@ -66,15 +47,33 @@ class FriendlyError extends Error {
     this.cause = cause;
   }
 }
+class Cancelled extends Error {}
+
+const store = {
+  get(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch {
+      return null;
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(key, value);
+    } catch {}
+  },
+};
 
 // ---------------------------------------------------------------- state
 
-let info = null; // analysed source video
-let result = null; // { file, original }
+let jobs = []; // one per picked file: { file, info, outputs: [], error }
 let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
 let wakeLock = null;
+let dateEdited = false;
+let pendingDecision = null; // { resolve, reject } while the trim screen is open
+let trimJob = null;
 const urls = new Set();
 
 function objectUrl(blob) {
@@ -83,20 +82,25 @@ function objectUrl(blob) {
   return u;
 }
 
-function cleanup() {
+function resetAll() {
   for (const u of urls) URL.revokeObjectURL(u);
   urls.clear();
   el.trimVideo.removeAttribute('src');
   el.trimVideo.load();
-  el.doneVideo.removeAttribute('src');
-  el.doneVideo.load();
-  try {
-    if (info) info.input.dispose();
-  } catch {}
-  info = null;
-  result = null;
+  el.results.replaceChildren();
+  for (const j of jobs) {
+    try {
+      if (j.info) j.info.input.dispose();
+    } catch {}
+  }
+  jobs = [];
+  pendingDecision = null;
+  trimJob = null;
   el.file.value = '';
 }
+
+const limitMB = () => Number(el.limit.value) || 20;
+const concert = () => el.concert.checked;
 
 // ---------------------------------------------------------------- screens
 
@@ -107,32 +111,57 @@ function show(name) {
   window.scrollTo(0, 0);
 }
 
+function describeError(e) {
+  const cause = e instanceof FriendlyError ? e.cause || e : e;
+  return String((cause && (cause.stack || cause.message)) || cause);
+}
+
 function showError(e) {
   console.error(e);
   const code = e instanceof FriendlyError && MESSAGES[e.code] ? e.code : 'generic';
   const [title, msg] = MESSAGES[code];
   el.errTitle.textContent = title;
   el.errMsg.textContent = msg;
-  const cause = e instanceof FriendlyError ? e.cause || e : e;
-  el.errDetail.textContent = String((cause && (cause.stack || cause.message)) || cause);
+  el.errDetail.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\n\n${describeError(e)}`;
   show('error');
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {}
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    document.body.append(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function flash(button, text) {
+  const old = button.textContent;
+  button.textContent = text;
+  await new Promise((r) => setTimeout(r, 1800));
+  button.textContent = old;
 }
 
 // ---------------------------------------------------------------- settings
 
-function getLimit() {
-  return Number(el.limit.value) || 20;
-}
-
 try {
-  const saved = localStorage.getItem('dr-limit');
+  const saved = store.get('dr-limit');
   if (saved && [...el.limit.options].some((o) => o.value === saved)) el.limit.value = saved;
+  if (store.get('dr-concert') === '0') el.concert.checked = false;
 } catch {}
-el.limit.addEventListener('change', () => {
-  try {
-    localStorage.setItem('dr-limit', el.limit.value);
-  } catch {}
-});
+el.limit.addEventListener('change', () => store.set('dr-limit', el.limit.value));
+el.concert.addEventListener('change', () => store.set('dr-concert', el.concert.checked ? '1' : '0'));
 
 // ---------------------------------------------------------------- analysis
 
@@ -143,11 +172,13 @@ async function analyze(file) {
     if (!video) throw new FriendlyError('novideo');
     if (!(await video.canDecode())) throw new FriendlyError('codec');
 
-    const [width, height, duration, stats] = await Promise.all([
+    const [width, height, duration, stats, hdr, tags] = await Promise.all([
       video.getDisplayWidth(),
       video.getDisplayHeight(),
       input.computeDuration(),
       video.computePacketStats(150),
+      video.hasHighDynamicRange().catch(() => false),
+      input.getMetadataTags().catch(() => ({})),
     ]);
 
     let audio = null;
@@ -161,61 +192,41 @@ async function analyze(file) {
       if (!bitrate) bitrate = (await audioTrack.computePacketStats(150)).averageBitrate;
       audio = { codec, channels, bitrate, decodable };
     }
-    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio };
+    return {
+      input,
+      file,
+      width,
+      height,
+      duration,
+      fps: stats.averagePacketRate,
+      audio,
+      hdr,
+      autoDate: C.recordedDate(tags && tags.date, file.lastModified),
+    };
   } catch (e) {
     input.dispose();
     throw e instanceof FriendlyError ? e : new FriendlyError('unreadable', e);
   }
 }
 
-function makePlan(duration, noCopy, limitMB = getLimit()) {
+function makePlan(info, duration, noCopy) {
+  const base = { duration, limitMB: limitMB(), width: info.width, height: info.height, fps: info.fps, concert: concert() };
   const audio = info.audio ? { codec: info.audio.codec, bitrate: info.audio.bitrate, channels: info.audio.channels } : null;
-  let plan = B.plan({ duration, limitMB, width: info.width, height: info.height, fps: info.fps, audio, noCopy });
+  let plan = B.plan({ ...base, audio, noCopy });
   // Sound we can neither copy nor decode has to go.
   if (plan.audio && !plan.audio.copy && !info.audio.decodable) {
-    plan = B.plan({ duration, limitMB, width: info.width, height: info.height, fps: info.fps, audio: null });
+    plan = B.plan({ ...base, audio: null });
     plan.audioDropped = true;
   }
   return plan;
 }
 
-// ---------------------------------------------------------------- picking a file
+const needsDecision = (plan) => plan.quality === 'low' || Math.min(plan.width, plan.height) < SOFT_BELOW;
 
-async function onFile(file) {
-  if (busy || !file) return;
-  busy = true;
-  cancelled = false;
-  cleanup();
-  setWorking('Reading your video…', 'This only takes a moment.');
-  show('work');
-  try {
-    info = await analyze(file);
-    if (cancelled) {
-      cleanup();
-      show('idle');
-      return;
-    }
-    if (B.fitsAlready(file.size, getLimit()) && !el.trimFirst.checked) {
-      finish({ file, original: true, plan: null, bytes: file.size });
-      return;
-    }
-    const plan = makePlan(info.duration, false);
-    if (el.trimFirst.checked || plan.quality === 'low') {
-      showTrim(plan.quality === 'low' ? 'long' : null);
-    } else {
-      await startEncode(null);
-    }
-  } catch (e) {
-    cleanup();
-    showError(e);
-  } finally {
-    busy = false;
-  }
-}
+// ---------------------------------------------------------------- picking files
 
-el.file.addEventListener('change', () => onFile(el.file.files && el.file.files[0]));
+el.file.addEventListener('change', () => onFiles([...(el.file.files || [])]));
 
-// Drag and drop for computers.
 for (const type of ['dragenter', 'dragover']) {
   document.addEventListener(type, (e) => {
     e.preventDefault();
@@ -229,26 +240,102 @@ for (const type of ['dragleave', 'drop']) {
   });
 }
 document.addEventListener('drop', (e) => {
-  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-  if (file && !$('screen-idle').hidden) onFile(file);
+  const files = [...((e.dataTransfer && e.dataTransfer.files) || [])];
+  if (files.length && !$('screen-idle').hidden) onFiles(files);
 });
 
-// ---------------------------------------------------------------- trim screen
+async function onFiles(files) {
+  if (busy || !files.length) return;
+  busy = true;
+  cancelled = false;
+  resetAll();
+  jobs = files.map((file) => ({ file, info: null, outputs: [], error: null }));
+  keepAwake();
+  setWorking('Reading your video…', 'This only takes a moment.', '');
+  show('work');
+  try {
+    for (let i = 0; i < jobs.length; i++) {
+      try {
+        await processJob(jobs[i], i, jobs.length);
+      } catch (e) {
+        if (e instanceof Cancelled) throw e;
+        console.error(e);
+        jobs[i].error = e;
+      }
+    }
+    if (jobs.every((j) => j.error)) throw jobs[0].error;
+    finishAll();
+  } catch (e) {
+    const wasCancelled = e instanceof Cancelled;
+    resetAll();
+    if (wasCancelled) show('idle');
+    else showError(e);
+  } finally {
+    busy = false;
+    releaseAwake();
+  }
+}
 
-const QUALITY_LABEL = { great: 'sharp', good: 'good', low: 'blurry' };
+// ---------------------------------------------------------------- one video
+
+async function processJob(job, index, total) {
+  const queue = total > 1 ? `Video ${index + 1} of ${total}` : '';
+  setWorking('Reading your video…', 'This only takes a moment.', queue);
+  show('work');
+  job.info = await analyze(job.file);
+  if (cancelled) throw new Cancelled();
+  const info = job.info;
+
+  if (B.fitsAlready(job.file.size, limitMB()) && !el.trimFirst.checked) {
+    job.outputs = [{ file: job.file, original: true, bytes: job.file.size, durationText: B.formatDuration(info.duration), plan: null, part: null }];
+    return;
+  }
+
+  let reason = null;
+  for (;;) {
+    const decision = await decide(job, reason, queue);
+    const segments = decision.parts || [decision.trim];
+    try {
+      const outputs = [];
+      for (let i = 0; i < segments.length; i++) {
+        const part = segments.length > 1 ? { index: i + 1, count: segments.length } : null;
+        outputs.push(await encodeSegment(job, segments[i], part, queue));
+      }
+      job.outputs = outputs;
+      return;
+    } catch (e) {
+      if (e instanceof FriendlyError && e.code === 'toobig') {
+        reason = 'big';
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+/** Decide trim/split for a video: only asks when the result would be soft, or when the user wants to trim. */
+async function decide(job, reason, queue) {
+  const plan = makePlan(job.info, job.info.duration, false);
+  if (!reason && !el.trimFirst.checked && !needsDecision(plan)) return { trim: null, parts: null };
+  return askTrim(job, reason || (needsDecision(plan) ? 'long' : null), queue);
+}
+
+// ---------------------------------------------------------------- trim / split screen
+
 const MIN_CLIP = 1;
+const QUALITY_LABEL = { great: 'sharp', good: 'good', low: 'blurry' };
 
 function trimValues() {
   return { start: Number(el.trimStart.value), end: Number(el.trimEnd.value) };
 }
 
 function updateTrim(changed) {
-  const dur = info.duration;
-  const gap = Math.min(MIN_CLIP, dur);
+  const info = trimJob.info;
+  const gap = Math.min(MIN_CLIP, info.duration);
   let { start, end } = trimValues();
   if (end - start < gap) {
     if (changed === 'start') start = Math.max(0, end - gap);
-    else end = Math.min(dur, start + gap);
+    else end = Math.min(info.duration, start + gap);
     el.trimStart.value = start;
     el.trimEnd.value = end;
   }
@@ -257,64 +344,77 @@ function updateTrim(changed) {
   if (changed) el.trimVideo.currentTime = changed === 'start' ? start : Math.max(0, end - 0.1);
 
   const len = end - start;
-  const plan = makePlan(len, start > 0.05);
-  const limit = getLimit();
-  let text = `Your clip will be ${B.formatDuration(len)} long, about ${Math.min(plan.width, plan.height)}p, and look ${QUALITY_LABEL[plan.quality]}.`;
-  const good = B.maxGoodSeconds(limit, !!plan.audio);
-  el.trimSummary.className = 'notice';
-  if (plan.quality === 'low') {
-    text += ` For a clear picture at ${limit} MB, keep it under about ${B.formatDuration(good)}.`;
-    el.trimSummary.classList.add('warn');
-  }
+  const plan = makePlan(info, len, start > 0.05);
+  const side = Math.min(plan.width, plan.height);
+  const soft = needsDecision(plan);
+  let text = `Your clip will be ${B.formatDuration(len)} long, about ${side}p, and look ${QUALITY_LABEL[plan.quality]}.`;
+  el.trimSummary.className = 'notice' + (soft ? ' warn' : '');
+  const parts = B.splitParts(start, end, limitMB(), concert());
+  if (soft && parts.length > 1) text += ` Splitting it into ${parts.length} parts keeps each one sharp.`;
   el.trimSummary.textContent = text;
+  el.trimSplit.hidden = parts.length < 2;
+  el.trimSplit.textContent = `Split into ${parts.length} parts`;
+  el.trimGo.textContent = soft && parts.length > 1 ? 'Shrink it as one video' : 'Shrink it';
 }
 
-function showTrim(reason) {
-  const dur = info.duration;
-  el.trimVideo.src = objectUrl(info.file);
+function askTrim(job, reason, queue) {
+  trimJob = job;
+  const info = job.info;
+  const limit = limitMB();
+  el.trimQueue.textContent = queue;
+  el.trimVideo.src = objectUrl(job.file);
   for (const r of [el.trimStart, el.trimEnd]) {
-    r.max = dur;
-    r.step = dur > 30 ? 0.5 : 0.1;
+    r.max = info.duration;
+    r.step = info.duration > 30 ? 0.5 : 0.1;
   }
   el.trimStart.value = 0;
-  el.trimEnd.value = dur;
-  const limit = getLimit();
+  el.trimEnd.value = info.duration;
+  const plan = makePlan(info, info.duration, false);
   el.trimInfo.textContent =
     reason === 'long'
-      ? `This video is ${B.formatDuration(dur)} long, so it would turn out blurry at ${limit} MB. Trim it for a sharper result, or shrink it as is.`
+      ? `This video is ${B.formatDuration(info.duration)} long, so at ${limit} MB it would come out about ${Math.min(plan.width, plan.height)}p and look soft. You can trim it, split it into sharp parts, or shrink it as it is.`
       : reason === 'big'
-        ? `That was still too big for ${limit} MB even after squeezing. Trim some off and try again.`
-        : `${B.formatDuration(dur)} · ${B.formatBytes(info.file.size)}. Drag the sliders to keep just the part you want.`;
+        ? `That was still too big for ${limit} MB even after squeezing. Trim some off, or split it into parts.`
+        : `${B.formatDuration(info.duration)} · ${B.formatBytes(job.file.size)}. Drag the sliders to keep just the part you want.`;
   updateTrim(null);
   show('trim');
+  return new Promise((resolve, reject) => {
+    pendingDecision = { resolve, reject };
+  });
+}
+
+function settleTrim(split) {
+  if (!pendingDecision) return;
+  const { start, end } = trimValues();
+  const info = trimJob.info;
+  const changed = start > 0.05 || end < info.duration - 0.05;
+  const trim = changed ? { start, end } : null;
+  const parts = split ? B.splitParts(start, end, limitMB(), concert()) : null;
+  const { resolve } = pendingDecision;
+  pendingDecision = null;
+  el.trimVideo.removeAttribute('src');
+  el.trimVideo.load();
+  show('work');
+  resolve({ trim, parts });
 }
 
 el.trimStart.addEventListener('input', () => updateTrim('start'));
 el.trimEnd.addEventListener('input', () => updateTrim('end'));
+el.trimGo.addEventListener('click', () => settleTrim(false));
+el.trimSplit.addEventListener('click', () => settleTrim(true));
 el.trimBack.addEventListener('click', () => {
-  cleanup();
-  show('idle');
-});
-el.trimGo.addEventListener('click', async () => {
-  if (busy) return;
-  busy = true;
-  const { start, end } = trimValues();
-  const changed = start > 0.05 || end < info.duration - 0.05;
-  try {
-    await startEncode(changed ? { start, end } : null);
-  } catch (e) {
-    cleanup();
-    showError(e);
-  } finally {
-    busy = false;
-  }
+  if (!pendingDecision) return;
+  const { reject } = pendingDecision;
+  pendingDecision = null;
+  reject(new Cancelled());
 });
 
 // ---------------------------------------------------------------- encoding
 
-function setWorking(title, status) {
+function setWorking(title, status, queue) {
   el.workTitle.textContent = title;
   el.workStatus.textContent = status;
+  el.workQueue.textContent = queue || '';
   setProgress(0);
   el.eta.textContent = '';
 }
@@ -341,10 +441,10 @@ function releaseAwake() {
   wakeLock = null;
 }
 document.addEventListener('visibilitychange', () => {
-  if (!document.hidden && current) keepAwake();
+  if (!document.hidden && busy) keepAwake();
 });
 window.addEventListener('beforeunload', (e) => {
-  if (current) {
+  if (busy) {
     e.preventDefault();
     e.returnValue = '';
   }
@@ -361,7 +461,8 @@ function ensureAacEncoder() {
   return aacReady;
 }
 
-async function encodeOnce(plan, trim, onProgress) {
+/** One conversion pass. `probe` encodes just a video sample, without sound. */
+async function encodeOnce(info, plan, trim, onProgress, probe = false) {
   const videoCodec = await MB.getFirstEncodableVideoCodec(VIDEO_CODECS, {
     width: plan.width,
     height: plan.height,
@@ -370,7 +471,7 @@ async function encodeOnce(plan, trim, onProgress) {
   if (!videoCodec) throw new FriendlyError('cantEncode');
 
   let audio; // undefined = let the converter copy the sound untouched
-  if (info.audio && !plan.audio) {
+  if (probe || (info.audio && !plan.audio)) {
     audio = { discard: true };
   } else if (plan.audio && !plan.audio.copy) {
     await ensureAacEncoder();
@@ -404,76 +505,84 @@ async function encodeOnce(plan, trim, onProgress) {
   current = conversion;
   try {
     await conversion.execute();
+  } catch (e) {
+    if (cancelled || e instanceof ConversionCanceledError) throw new Cancelled();
+    throw e;
   } finally {
     current = null;
   }
   return { buffer: output.target.buffer, videoCodec };
 }
 
-async function startEncode(trim) {
-  const length = trim ? trim.end - trim.start : info.duration;
-  const limit = getLimit();
-  const plan = makePlan(length, !!(trim && trim.start > 0.05));
-  let videoBps = plan.videoBitrate;
-  cancelled = false;
-
-  show('work');
-  keepAwake();
-  try {
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
-      const attemptPlan = { ...plan, videoBitrate: videoBps, ...layout };
-      setWorking(
-        'Shrinking your video…',
-        attempt === 1
-          ? `Making it ${Math.min(layout.width, layout.height)}p to fit ${limit} MB.`
-          : 'Almost there. Making it a little smaller…',
-      );
-      const started = performance.now();
-      let out;
-      try {
-        out = await encodeOnce(attemptPlan, trim, (p) => {
-          setProgress(p);
-          const elapsed = (performance.now() - started) / 1000;
-          el.eta.textContent = p > 0.04 && elapsed > 3 ? `About ${B.formatDuration((elapsed / p) * (1 - p))} left` : '';
-        });
-      } catch (e) {
-        if (cancelled || e instanceof ConversionCanceledError) {
-          cleanup();
-          show('idle');
-          return;
-        }
-        throw e;
-      }
-      if (out.buffer.byteLength <= plan.acceptBytes) {
-        setProgress(1);
-        const name = outputName(info.file.name);
-        const file = new File([out.buffer], name, { type: 'video/mp4', lastModified: Date.now() });
-        finish({
-          file,
-          original: false,
-          plan: attemptPlan,
-          bytes: file.size,
-          note: [
-            plan.audioDropped ? "The sound couldn't be kept for this video." : '',
-            out.videoCodec !== 'avc' ? "This browser can't make the most compatible video type, so some devices may not preview it." : '',
-          ]
-            .filter(Boolean)
-            .join(' '),
-        });
-        return;
-      }
-      videoBps = B.retryVideoBitrate(videoBps, plan.targetBytes, out.buffer.byteLength);
-    }
-    showTrim('big');
-  } finally {
-    releaseAwake();
-  }
+function progressReporter() {
+  const started = performance.now();
+  return (p) => {
+    setProgress(p);
+    const elapsed = (performance.now() - started) / 1000;
+    el.eta.textContent = p > 0.04 && elapsed > 3 ? `About ${B.formatDuration((elapsed / p) * (1 - p))} left` : '';
+  };
 }
 
-function outputName(name) {
+/** Shrink one segment (the whole video, a trimmed range or one part) to fit the limit. */
+async function encodeSegment(job, seg, part, queue) {
+  const info = job.info;
+  const length = seg ? seg.end - seg.start : info.duration;
+  const plan = makePlan(info, length, !!(seg && seg.start > 0.05));
+  const label = [queue, part ? `Part ${part.index} of ${part.count}` : ''].filter(Boolean).join(' · ');
+  let videoBps = plan.videoBitrate;
+
+  // Encode a short sample first: it shows how this phone's encoder really behaves, so the full pass usually
+  // lands on the first try instead of being redone.
+  if (length >= PROBE_MIN_CLIP) {
+    setWorking('Checking your video…', 'A quick test so the real run is right first time.', label);
+    const from = (seg ? seg.start : 0) + (length - PROBE_SECONDS) * 0.45;
+    const sample = { start: from, end: from + PROBE_SECONDS };
+    const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
+    try {
+      const probed = await encodeOnce(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
+      videoBps = B.calibrate(videoBps, (probed.buffer.byteLength * 8) / PROBE_SECONDS);
+    } catch (e) {
+      if (e instanceof Cancelled || (e instanceof FriendlyError && e.code === 'cantEncode')) throw e;
+      console.warn('Sample pass failed, continuing without it', e);
+    }
+  }
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
+    const attemptPlan = { ...plan, videoBitrate: videoBps, ...layout };
+    setWorking(
+      'Shrinking your video…',
+      attempt === 1 ? `Making it ${Math.min(layout.width, layout.height)}p to fit ${limitMB()} MB.` : 'Almost there. Making it a little smaller…',
+      label,
+    );
+    const out = await encodeOnce(info, attemptPlan, seg, progressReporter());
+    if (out.buffer.byteLength <= plan.acceptBytes) {
+      setProgress(1);
+      const file = new File([out.buffer], outputName(info.file.name, part), { type: 'video/mp4', lastModified: Date.now() });
+      return {
+        file,
+        original: false,
+        bytes: file.size,
+        plan: attemptPlan,
+        part,
+        durationText: B.formatDuration(length),
+        note: [
+          plan.audioDropped ? "The sound couldn't be kept for this video." : '',
+          info.hdr ? 'This was an HDR video, so colors may look a little different.' : '',
+          out.videoCodec !== 'avc' ? "This browser can't make the most compatible video type, so some devices may not preview it." : '',
+        ]
+          .filter(Boolean)
+          .join(' '),
+      };
+    }
+    videoBps = B.retryVideoBitrate(videoBps, plan.targetBytes, out.buffer.byteLength);
+  }
+  throw new FriendlyError('toobig');
+}
+
+function outputName(name, part) {
   const base = (name || 'video').replace(/\.[^.]+$/, '').replace(/[^\w.\- ]+/g, '_').slice(0, 60) || 'video';
-  return `${base}-discord.mp4`;
+  return `${base}${part ? `-part${part.index}of${part.count}` : ''}-discord.mp4`;
 }
 
 el.cancelBtn.addEventListener('click', async () => {
@@ -481,18 +590,84 @@ el.cancelBtn.addEventListener('click', async () => {
   if (current) await current.cancel();
 });
 
-// ---------------------------------------------------------------- result
+// ---------------------------------------------------------------- results
 
-function finish({ file, original, plan, bytes, note }) {
-  result = { file, original };
-  const before = info ? info.file.size : bytes;
-  if (original) {
-    el.doneTitle.textContent = 'Already small enough!';
-    el.doneSizes.textContent = B.formatBytes(bytes);
-    el.doneDetail.textContent = `This video is already under ${getLimit()} MB, so there's nothing to shrink.`;
+const flat = () => jobs.flatMap((job) => job.outputs.map((out) => ({ job, out })));
+
+function captionFor({ job, out }) {
+  return C.build({
+    event: el.capEvent.value,
+    venue: el.capVenue.value,
+    dateISO: dateEdited ? el.capDate.value : job.info.autoDate || el.capDate.value,
+    note: el.capNote.value,
+    durationText: out.durationText,
+    part: out.part,
+  });
+}
+
+function refreshCaption() {
+  const items = flat();
+  el.capPreview.textContent = items.length ? captionFor(items[0]) : '';
+}
+
+function addCard(job, out) {
+  const card = document.createElement('div');
+  card.className = 'card item';
+  const name = document.createElement('div');
+  name.className = 'name';
+  name.textContent = out.file.name;
+  const meta = document.createElement('div');
+  meta.className = 'muted small';
+  const side = out.plan ? `${Math.min(out.plan.width, out.plan.height)}p · ` : '';
+  meta.textContent = out.original ? `${B.formatBytes(out.bytes)} · already small enough` : `${B.formatBytes(out.bytes)} · ${side}${out.durationText}`;
+  const video = document.createElement('video');
+  video.controls = true;
+  video.playsInline = true;
+  video.preload = 'metadata';
+  video.src = objectUrl(out.file);
+  const status = document.createElement('p');
+  status.className = 'small status';
+  status.hidden = true;
+  card.append(video, name, meta, status);
+  out.ui = { status };
+  el.results.append(card);
+}
+
+function setStatus(out, text, kind) {
+  out.ui.status.hidden = !text;
+  out.ui.status.textContent = text || '';
+  out.ui.status.className = 'small status' + (kind ? ' ' + kind : '');
+}
+
+function finishAll() {
+  const ok = jobs.filter((j) => !j.error);
+  const failed = jobs.filter((j) => j.error);
+  const outputs = flat();
+
+  el.results.replaceChildren();
+  for (const job of ok) for (const out of job.outputs) addCard(job, out);
+  for (const job of failed) {
+    const card = document.createElement('div');
+    card.className = 'card item';
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = job.file.name;
+    const why = document.createElement('p');
+    why.className = 'small status err';
+    const code = job.error instanceof FriendlyError && MESSAGES[job.error.code] ? job.error.code : 'generic';
+    why.textContent = `${MESSAGES[code][0]}. ${MESSAGES[code][1]}`;
+    card.append(name, why);
+    el.results.append(card);
+  }
+
+  const before = ok.reduce((n, j) => n + j.file.size, 0);
+  const after = outputs.reduce((n, o) => n + o.out.bytes, 0);
+  const allOriginal = outputs.every((o) => o.out.original);
+  el.doneTitle.textContent = failed.length ? 'Done, with problems' : allOriginal ? 'Already small enough!' : 'Ready to send!';
+  el.doneSizes.textContent = '';
+  if (allOriginal) {
+    el.doneSizes.textContent = outputs.length > 1 ? `${outputs.length} videos, no shrinking needed` : B.formatBytes(after);
   } else {
-    el.doneTitle.textContent = 'Ready to send!';
-    el.doneSizes.innerHTML = '';
     const a = document.createElement('span');
     a.textContent = B.formatBytes(before);
     const arrow = document.createElement('span');
@@ -500,29 +675,110 @@ function finish({ file, original, plan, bytes, note }) {
     arrow.textContent = ' → ';
     const b = document.createElement('span');
     b.className = 'after';
-    b.textContent = B.formatBytes(bytes);
+    b.textContent = B.formatBytes(after);
     el.doneSizes.append(a, arrow, b);
-    el.doneDetail.textContent = `${Math.min(plan.width, plan.height)}p · ${B.formatDuration(info.duration)}`;
   }
-  el.doneNote.hidden = !note;
-  el.doneNote.textContent = note || '';
-  el.doneVideo.src = objectUrl(file);
+  const notes = [...new Set(outputs.map((o) => o.out.note).filter(Boolean))];
+  el.doneNote.hidden = !notes.length;
+  el.doneNote.textContent = notes.join(' ');
 
+  // Message fields: event and venue are remembered between clips; the date comes from the video.
+  el.capEvent.value = store.get('dr-event') || '';
+  el.capVenue.value = store.get('dr-venue') || '';
+  el.capNote.value = '';
+  dateEdited = false;
+  el.capDate.value = (outputs[0] && outputs[0].job.info.autoDate) || '';
+  el.capEdit.open = !el.capEvent.value; // first time: ask who/where; afterwards it is remembered
+  refreshCaption();
+
+  // Posting and sharing options.
+  const hook = loadHook();
+  el.postBtn.hidden = !hook;
+  el.nameField.hidden = !hook;
+  el.postTo.hidden = !hook;
+  if (hook) el.postTo.textContent = `Posts to the thread whose ID ends ${describeHook(hook)}.`;
+  el.postStatus.hidden = true;
+  el.postBtn.disabled = false;
+  el.postBtn.textContent = outputs.length > 1 ? 'Post all to the thread' : 'Post to the thread';
+  el.posterName.value = store.get('dr-name') || '';
   let canShare = false;
   try {
-    canShare = !!(navigator.canShare && navigator.share && navigator.canShare({ files: [file] }));
+    const files = outputs.map((o) => o.out.file);
+    canShare = !!(navigator.canShare && navigator.share && files.length && navigator.canShare({ files }));
   } catch {}
   el.shareBtn.hidden = !canShare;
-  el.shareTip.hidden = !canShare;
-  el.saveBtn.classList.toggle('primary', !canShare);
+  el.shareBtn.classList.toggle('primary', canShare && !hook);
+  el.saveBtn.classList.toggle('primary', !canShare && !hook);
   el.saveBtn.textContent = canShare ? 'Save to my device' : 'Download';
   show('done');
 }
 
-el.shareBtn.addEventListener('click', async () => {
-  if (!result) return;
+for (const [input, key] of [[el.capEvent, 'dr-event'], [el.capVenue, 'dr-venue']]) {
+  input.addEventListener('input', () => {
+    store.set(key, input.value);
+    refreshCaption();
+  });
+}
+el.capNote.addEventListener('input', refreshCaption);
+el.capDate.addEventListener('input', () => {
+  dateEdited = true;
+  refreshCaption();
+});
+
+el.copyCaption.addEventListener('click', async () => {
+  const ok = await copyText(flat().map(captionFor).join('\n\n'));
+  flash(el.copyCaption, ok ? 'Copied ✓' : "Couldn't copy");
+});
+
+el.postBtn.addEventListener('click', async () => {
+  const hook = loadHook();
+  const items = flat();
+  if (!hook || !items.length) return;
+  const name = el.posterName.value.trim();
+  el.postStatus.hidden = false;
+  el.postStatus.className = 'muted';
+  if (!name) {
+    el.postStatus.textContent = 'Type your name first so people know who posted it.';
+    el.posterName.focus();
+    return;
+  }
+  store.set('dr-name', name);
+  el.postBtn.disabled = true;
   try {
-    await navigator.share({ files: [result.file] });
+    for (const item of items) {
+      const { out } = item;
+      if (out.posted) continue;
+      setStatus(out, 'Posting…');
+      el.postStatus.textContent = items.length > 1 ? `Posting ${items.indexOf(item) + 1} of ${items.length}…` : 'Posting…';
+      await postToThread({
+        hook,
+        username: name,
+        content: captionFor(item),
+        file: out.file,
+        onProgress: (p) => setStatus(out, `Posting… ${Math.round(p * 100)}%`),
+      });
+      out.posted = true;
+      setStatus(out, 'Posted ✓', 'ok');
+    }
+    el.postStatus.textContent = 'Posted to the thread ✓';
+    el.postBtn.textContent = 'Posted ✓';
+  } catch (e) {
+    const code = e instanceof PostError ? e.code : 'rejected';
+    const failedItem = items.find((i) => !i.out.posted);
+    if (failedItem) setStatus(failedItem.out, POST_MESSAGES[code], 'err');
+    el.postStatus.textContent = POST_MESSAGES[code];
+    el.postStatus.className = 'notice bad';
+    el.postBtn.disabled = false;
+    el.postBtn.textContent = 'Try again';
+    console.error(e);
+  }
+});
+
+el.shareBtn.addEventListener('click', async () => {
+  const files = flat().map((o) => o.out.file);
+  if (!files.length) return;
+  try {
+    await navigator.share({ files });
   } catch (e) {
     if (e && e.name === 'AbortError') return;
     el.doneNote.hidden = false;
@@ -530,29 +786,75 @@ el.shareBtn.addEventListener('click', async () => {
   }
 });
 
-el.saveBtn.addEventListener('click', () => {
-  if (!result) return;
-  const a = document.createElement('a');
-  a.href = objectUrl(result.file);
-  a.download = result.file.name;
-  document.body.append(a);
-  a.click();
-  a.remove();
+el.saveBtn.addEventListener('click', async () => {
+  for (const { out } of flat()) {
+    const a = document.createElement('a');
+    a.href = objectUrl(out.file);
+    a.download = out.file.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
+    await new Promise((r) => setTimeout(r, 400));
+  }
 });
 
 el.againBtn.addEventListener('click', () => {
-  cleanup();
+  resetAll();
   show('idle');
 });
 el.errBack.addEventListener('click', () => {
-  cleanup();
+  resetAll();
   show('idle');
+});
+el.errCopy.addEventListener('click', async () => flash(el.errCopy, (await copyText(el.errDetail.textContent)) ? 'Copied ✓' : "Couldn't copy"));
+
+// ---------------------------------------------------------------- thread link
+
+// A setup link is only a request to connect: anyone can make one, so nothing is saved until the user agrees.
+let pendingHook = null;
+
+function refreshHookStatus() {
+  const saved = loadHook();
+  el.hookStatus.hidden = !saved;
+  if (saved) el.hookThread.textContent = 'thread ' + describeHook(saved);
+  const asking = pendingHook && !sameHook(pendingHook, saved);
+  el.hookPrompt.hidden = !asking;
+  if (asking) {
+    el.hookPromptText.textContent =
+      `This link can post your videos to a Discord thread (its ID ends ${describeHook(pendingHook)}).` +
+      (saved ? ' It would replace the thread you are connected to now.' : '') +
+      ' Only connect if a friend sent you this link in your server.';
+  }
+}
+el.hookConnect.addEventListener('click', () => {
+  if (pendingHook) saveHook(pendingHook);
+  pendingHook = null;
+  refreshHookStatus();
+});
+el.hookIgnore.addEventListener('click', () => {
+  pendingHook = null;
+  refreshHookStatus();
+});
+el.hookForget.addEventListener('click', () => {
+  forgetHook();
+  refreshHookStatus();
 });
 
 // ---------------------------------------------------------------- boot
 
 async function boot() {
   window.__drBooted = true;
+  el.version.textContent = 'v' + window.DR_VERSION;
+  pendingHook = captureHookFromLocation();
+  refreshHookStatus();
+
+  // WKWebView-style in-app browsers on iPhone have no "Safari/" token; they are the ones that misbehave.
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (ios && !/Safari\//.test(ua)) el.inAppBanner.hidden = false;
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
   let problem = null;
   if (!window.isSecureContext) problem = 'insecure';
   else if (!('VideoEncoder' in window) || !('VideoDecoder' in window)) problem = 'browser';
@@ -568,13 +870,13 @@ async function boot() {
     el.unsupportedMsg.textContent =
       problem === 'insecure'
         ? 'Open this from its website link instead of a saved file.'
-        : "On iPhone, open this link in Safari (iOS 16.4 or newer). On Android, use Chrome. On a computer, use Chrome, Edge or Safari. If you opened it from inside Discord, tap the menu and choose “Open in browser”.";
+        : 'On iPhone, open this link in Safari (iOS 16.4 or newer). On Android, use Chrome. On a computer, use Chrome, Edge or Safari. If you opened it from inside Discord, tap the menu and choose “Open in browser”.';
     show('unsupported');
   }
 }
 
 window.addEventListener('unhandledrejection', (e) => {
-  if (e.reason instanceof ConversionCanceledError) return e.preventDefault();
+  if (e.reason instanceof ConversionCanceledError || e.reason instanceof Cancelled) e.preventDefault();
 });
 
 boot();

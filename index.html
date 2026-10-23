@@ -4,9 +4,12 @@
 <meta charset="utf-8">
 <title>Shrink video for Discord</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="Make any video small enough to send on Discord for free. Runs on your phone; nothing is uploaded.">
+<meta name="description" content="Make any video small enough to send on Discord for free. Runs on your phone; nothing is uploaded unless you post it.">
 <meta name="theme-color" content="#1e1f22">
 <meta name="color-scheme" content="dark light">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'self' https://discord.com https://ptb.discord.com https://canary.discord.com https://discordapp.com; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<meta name="referrer" content="no-referrer">
+<script>if (window.top !== window.self) { try { window.top.location.replace(window.self.location.href); } catch (e) {} document.documentElement.hidden = true; }</script>
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Shrink">
@@ -87,6 +90,19 @@
   .check { display: flex; align-items: center; gap: 12px; min-height: 44px; cursor: pointer; }
   .check input { width: 22px; height: 22px; accent-color: var(--primary); flex: none; }
 
+  input[type=text], input[type=date] {
+    font: inherit; font-size: 16px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 12px; min-height: 48px; padding: 8px 12px; width: 100%;
+  }
+  input[type=text]:focus-visible, input[type=date]:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+  h3 { font-size: 17px; margin: 0; }
+  .preview { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--bg); border: 1px dashed var(--line); font-family: inherit; font-size: 15px; line-height: 1.4; color: var(--text); }
+  .item { padding: 12px; gap: 8px; display: flex; flex-direction: column; }
+  .item video { max-height: 30vh; }
+  .item .name { font-weight: 600; overflow-wrap: anywhere; }
+  .item .status.ok { color: var(--good); }
+  .item .status.err { color: var(--bad); }
+  .btn[disabled] { opacity: .6; cursor: default; }
   video { width: 100%; max-height: 52vh; border-radius: var(--radius); background: #000; display: block; }
   .bar { height: 14px; border-radius: 99px; background: var(--line); overflow: hidden; }
   .bar > div { height: 100%; width: 0%; background: var(--primary); border-radius: 99px; transition: width .2s linear; }
@@ -110,6 +126,7 @@
 <body>
 <main>
   <div class="brand"><img src="icon-192.png" alt="" width="28" height="28"> Shrink for Discord</div>
+  <p id="inAppBanner" class="notice warn" hidden>Tip: if something doesn't work here, open this link in Safari (tap the compass or ⋯ icon).</p>
 
   <!-- 1. pick a video -->
   <section id="screen-idle" class="stack" data-screen>
@@ -117,8 +134,14 @@
       <h1 tabindex="-1">Make a video small enough for Discord</h1>
       <p class="muted">Pick a video and we'll squeeze it under Discord's limit so you can send it for free.</p>
     </div>
-    <input id="file" class="vh" type="file" accept="video/*">
-    <label for="file" class="btn primary big" id="chooseBtn">Choose a video</label>
+    <input id="file" class="vh" type="file" accept="video/*" multiple>
+    <label for="file" class="btn primary big" id="chooseBtn">Choose videos</label>
+    <div id="hookPrompt" class="notice warn stack" hidden>
+      <p id="hookPromptText"></p>
+      <button class="btn primary" id="hookConnect" type="button">Connect</button>
+      <button class="btn link" id="hookIgnore" type="button">No thanks</button>
+    </div>
+    <p id="hookStatus" class="muted small" hidden>✓ Connected to the group thread (<span id="hookThread"></span>). <button class="btn link" id="hookForget" type="button" style="display:inline;width:auto;min-height:0;padding:0">Disconnect</button></p>
     <div class="field">
       <label for="limit">Discord size limit</label>
       <select id="limit">
@@ -128,6 +151,7 @@
       </select>
       <p class="muted small">Only pick a bigger size if your Discord lets you upload that much.</p>
     </div>
+    <label class="check"><input id="concert" type="checkbox" checked><span>Concert mode (keeps the sound sharp)</span></label>
     <label class="check"><input id="trimFirst" type="checkbox"><span>Let me trim it first</span></label>
     <p id="dropHint" class="muted small">…or drop a video anywhere on this page</p>
   </section>
@@ -136,6 +160,7 @@
   <section id="screen-trim" class="stack" data-screen hidden>
     <div>
       <h2 tabindex="-1">Trim your video</h2>
+      <p class="muted small" id="trimQueue"></p>
       <p class="muted" id="trimInfo"></p>
     </div>
     <video id="trimVideo" playsinline muted controls preload="metadata"></video>
@@ -149,6 +174,7 @@
     </div>
     <p id="trimSummary" class="notice" aria-live="polite"></p>
     <button class="btn primary big" id="trimGo" type="button">Shrink it</button>
+    <button class="btn big" id="trimSplit" type="button" hidden>Split into parts</button>
     <button class="btn link" id="trimBack" type="button">Choose a different video</button>
   </section>
 
@@ -156,6 +182,7 @@
   <section id="screen-work" class="stack" data-screen hidden>
     <div>
       <h2 tabindex="-1" id="workTitle">Shrinking your video…</h2>
+      <p class="muted small" id="workQueue"></p>
       <p class="muted" id="workStatus" aria-live="polite">Getting started…</p>
     </div>
     <div class="bar" role="progressbar" aria-label="Progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="bar"><div></div></div>
@@ -169,14 +196,33 @@
     <div>
       <h2 tabindex="-1" id="doneTitle">Ready to send!</h2>
       <p class="sizes" id="doneSizes"></p>
-      <p class="muted" id="doneDetail"></p>
     </div>
-    <video id="doneVideo" playsinline controls preload="metadata"></video>
+    <div id="results" class="stack"></div>
     <p class="notice warn" id="doneNote" hidden></p>
-    <button class="btn primary big" id="shareBtn" type="button" hidden>Send to Discord</button>
+    <div class="card stack" id="captionCard">
+      <h3>Message</h3>
+      <pre class="preview" id="capPreview" aria-label="Message preview"></pre>
+      <details id="capEdit">
+        <summary>Edit message</summary>
+        <div class="stack" style="margin-top:14px">
+          <div class="field"><label for="capEvent">Artist or event</label><input id="capEvent" type="text" maxlength="100" autocomplete="off" enterkeyhint="done"></div>
+          <div class="field"><label for="capVenue">Venue</label><input id="capVenue" type="text" maxlength="100" autocomplete="off" enterkeyhint="done"></div>
+          <div class="field"><label for="capDate">Date</label><input id="capDate" type="date"></div>
+          <div class="field"><label for="capNote">Note (optional)</label><input id="capNote" type="text" maxlength="300" autocomplete="off" enterkeyhint="done"></div>
+        </div>
+      </details>
+      <button class="btn" id="copyCaption" type="button">Copy message</button>
+    </div>
+    <div class="field" id="nameField" hidden>
+      <label for="posterName">Your name (shown on the post)</label>
+      <input id="posterName" type="text" maxlength="60" autocomplete="nickname" enterkeyhint="done">
+    </div>
+    <p class="muted small" id="postTo" hidden></p>
+    <button class="btn primary big" id="postBtn" type="button" hidden>Post to the thread</button>
+    <p class="muted" id="postStatus" aria-live="polite" hidden></p>
+    <button class="btn big" id="shareBtn" type="button" hidden>Send with the share sheet</button>
     <button class="btn" id="saveBtn" type="button">Save to my device</button>
-    <p class="muted small" id="shareTip" hidden>Tap <b>Send to Discord</b>, then choose Discord and the chat.</p>
-    <button class="btn link" id="againBtn" type="button">Shrink another video</button>
+    <button class="btn link" id="againBtn" type="button">Shrink more videos</button>
   </section>
 
   <!-- 5. problems -->
@@ -186,6 +232,7 @@
       <p id="errMsg"></p>
     </div>
     <details><summary>Technical details</summary><pre id="errDetail"></pre></details>
+    <button class="btn" id="errCopy" type="button">Copy details</button>
     <button class="btn primary" id="errBack" type="button">Try again</button>
   </section>
 
@@ -196,7 +243,7 @@
     </div>
   </section>
 
-  <footer>Runs on your device. Your video is never uploaded.</footer>
+  <footer>Runs on your device. Nothing is uploaded unless you post it to Discord. <span id="version"></span></footer>
 </main>
 
 <noscript><p style="padding:16px">This page needs JavaScript.</p></noscript>
@@ -211,7 +258,9 @@
     u.hidden = false;
   }, 6000);
 </script>
+<script src="version.js"></script>
 <script src="budget.js"></script>
+<script src="caption.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>

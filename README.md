@@ -1,27 +1,46 @@
 # Shrink video for Discord
 
-A web page that makes any video small enough to send on Discord without Nitro. Built for phones:
+A web page that makes videos small enough to send on Discord without Nitro. Built for phones:
 
 1. Open the link.
-2. Tap **Choose a video**.
+2. Tap **Choose videos** (one or several).
 3. Wait for the bar to finish (keep the screen on).
-4. Tap **Send to Discord**, pick Discord and the chat.
+4. Tap **Post to the thread**, or **Send with the share sheet** and pick Discord.
 
-Everything happens **on your own device**. The video is never uploaded anywhere, and there is nothing to install.
+Everything is shrunk **on your own device**. Nothing is uploaded unless you tap Post or Send, and there is nothing to install.
 
-Default limit is **20 MB** (Discord's free limit since August 2026, per news reports; Discord's own help page wasn't reachable when this was written, so double-check it). A dropdown offers 10 MB in case 20 MB is rejected for you, and 50 MB for Nitro Basic. Very long videos get blurry at 10 MB, so the page offers to trim them first. Discord now measures the size of the file before the phone app compresses it, so an original that looks small enough can still be rejected.
+- **Size limit:** default **20 MB** (Discord's free limit since August 2026, per news reports; Discord's own help page wasn't reachable when this was written, so double-check it). The dropdown also offers 10 MB, in case 20 MB is rejected for you, and 50 MB for Nitro Basic.
+- **Long videos:** if a clip would come out soft, the page offers to trim it or **split it into sharp parts**.
+- **Concert mode** (on by default) keeps the sound at 128 kbps where the size allows.
+- **Message:** a caption (artist/event, venue, date, length, part 1/3…) is built for every video. The date comes from the video itself; artist and venue are remembered. Location and device info are *not* copied into the shrunk file.
+- **Works offline** once opened one time.
 
 ## Put it online (one time)
 
-The page is plain static files. The simplest free host is GitHub Pages:
+The page is plain static files, so no server is needed. Free options:
 
-1. Merge this branch into `main` (or keep using the branch).
-2. Repo **Settings → Pages → Build and deployment → Deploy from a branch**, pick the branch and `/ (root)`.
-3. After a minute the site is at `https://<your-user>.github.io/discord-reduce/`. Post that link in your Discord server and pin it.
+- **GitHub Pages:** repo **Settings → Pages → Deploy from a branch → `main` / `(root)`**. Site: `https://<user>.github.io/discord-reduce/`. Needs a public repo (or a paid plan).
+- **Cloudflare Pages** (also free): connect the repo, no build command, output folder `/`. Site: `https://<project>.pages.dev`. It also applies the security headers in `_headers`.
 
-Free GitHub Pages needs a public repository. Cloudflare Pages or Netlify (drag the folder in) work too. It must be served over HTTPS: the video APIs the page uses are disabled on plain `http://` and on `file://`.
+It must be served over HTTPS: the video APIs it uses are disabled on plain `http://` and `file://`.
 
-Friends can use "Add to Home Screen" in their browser menu to get an app icon.
+**Same-origin note for GitHub Pages:** every project under `<user>.github.io` shares one browser origin, so another site hosted there could read the saved thread link from your friends' browsers. If you host other sites on that account, use Cloudflare Pages or a custom domain for this one.
+
+## Post straight to your thread (optional)
+
+Without this, friends use the share sheet. With it, they tap one button and the video lands in the thread with its caption.
+
+1. In Discord on a computer: **Server Settings → Integrations → Webhooks → New Webhook**, pick the channel the thread is in, **Copy Webhook URL**. (You need the Manage Webhooks permission.)
+2. Copy the link to the thread (long-press or right-click the thread → **Copy Link**).
+3. Open `setup.html` on your site, paste both, press **Make the link**, then **Send a test message**. If the test shows up in the thread, share the link it made with your friends. Opening it asks them to **Connect** once.
+
+**Treat the link like a password.** Anyone who has it can post into that one thread (and nothing else). It never goes in this repository. It travels in the part of the address after `#`, which browsers don't send to servers. If it leaks, delete the webhook in Discord and make a new link.
+
+Things to know:
+- Posts appear from the webhook, under the name each friend types, so anyone with the link could use any name.
+- Mentions are switched off for posts (`@everyone` is just text).
+- Keep the thread from auto-archiving, or posts may fail.
+- The page asks before connecting a link, shows the last digits of the thread, and never replaces an existing connection silently. Anyone can craft a link that points at *their* webhook, so friends should only connect links from you.
 
 ## Supported browsers
 
@@ -35,30 +54,35 @@ If a link opened inside Discord doesn't work, tap the menu and choose "Open in b
 
 ## How it works
 
-`app.js` uses [Mediabunny](https://github.com/Vanilagy/mediabunny) (WebCodecs) to decode the video, scale it, re-encode it with the device's hardware H.264 encoder and write a fast-start MP4. `budget.js` works out the bitrate, resolution and frame rate that fit the limit (about 7% under it, for safety). If the first pass lands over the limit, it is redone once or twice at a lower bitrate. Sound that is already AAC is copied unchanged; otherwise it is re-encoded to AAC (the bundled WASM encoder is only loaded on browsers that lack a native one). Location and device tags are not copied into the result.
+`app.js` uses [Mediabunny](https://github.com/Vanilagy/mediabunny) (WebCodecs) to decode the video, scale it, re-encode it with the device's hardware H.264 encoder and write a fast-start MP4. `budget.js` works out the bitrate, resolution and frame rate that fit the limit (about 7% under it). Before the real run a 4-second sample is encoded to see how the phone's encoder behaves, so the real run is usually right first time; if it still lands over the limit it is redone smaller. Sound that is already AAC is copied unchanged; otherwise it is re-encoded to AAC (a bundled WebAssembly encoder is used on browsers without one). `caption.js` builds the message, `discord.mjs` posts it.
 
-The result is handed to the system share sheet (`navigator.share`) so Discord appears directly; **Save** downloads it instead.
+## Check an iPhone without owning one
 
-## Test it on a real phone
+Ask a friend to open `diag.html` on their phone and tap **Run the check**, then **Copy report** and paste it to you. It lists what their phone supports and runs a real 3-second encode with timing. They can also pick one video to inspect (codec, HDR, which metadata it carries; values are not shown). The footer of the main page shows the version.
 
-The automated tests run in desktop Chromium without H.264, so please check these once on devices after deploying:
-
-1. iPhone: pick a video from Photos (ideally one shot in HDR) and a long one (>1 min). Check colours look normal in the result and **Send to Discord** lists Discord.
-2. Android: same, from the Gallery.
-3. Send the result in a Discord chat and play it on both phone and desktop.
-4. Try with Discord's in-app browser (tap the link from inside Discord) and note if anything fails.
-5. Lock the screen mid-shrink: it should pause and carry on when you come back.
+Then, on the real site, ask them to:
+1. Shrink one normal clip and one HDR/Dolby Vision clip (iPhone default), check colours look right, and play the result in Discord on phone and desktop.
+2. Try **Post to the thread** and **Send with the share sheet**.
+3. Tap the link from inside Discord and note whether anything fails there. The **Copy details** button on an error screen gives you something to paste.
 
 ## Development
 
 ```
-node --test tests/budget.test.mjs   # sizing maths
-node tests/e2e.mjs                  # needs ffmpeg/ffprobe and Playwright's Chromium
-python3 -m http.server              # then open http://localhost:8000
+npm test                      # unit tests: sizing, captions, webhook, vendored files
+node tests/e2e.mjs            # needs ffmpeg/ffprobe and Playwright's Chromium
+python3 -m http.server        # then open http://localhost:8000
 ```
 
-`localhost` counts as a secure context, so the page works there. The end-to-end test shrinks generated clips in a phone-sized browser and checks the downloaded files with `ffprobe` (size, duration, orientation, audio, fast-start). Since headless Chromium cannot encode H.264, the page falls back to VP9-in-MP4 there.
+`localhost` counts as a secure context, so the page works there. The end-to-end test drives a phone-sized browser through shrink, split, batch, posting (against a fake Discord), connect prompts, offline use and the phone check, and verifies the output files with `ffprobe`. Headless Chromium cannot encode H.264, so there the page falls back to VP9-in-MP4; the H.264 path and iPhone behaviour need a real phone.
+
+Bump `version.js` on every release (it names the offline cache and shows in the footer).
+
+## Security notes
+
+- No code is loaded from other sites; the libraries are vendored and pinned (`vendor/SHA256SUMS`, checked by a test). The page's Content-Security-Policy limits network requests to itself and Discord.
+- Everything typed by users is inserted as text, and captions are escaped so they can't become formatting or pings.
+- The service worker only handles this site's own files, never Discord traffic.
 
 ## Third-party code
 
-`vendor/` holds unmodified builds of `mediabunny` and `@mediabunny/aac-encoder` 1.62.1 (MPL-2.0, see `vendor/LICENSE-mediabunny.txt`; the AAC encoder is a WebAssembly build of FFmpeg's AAC encoder). Sources: <https://github.com/Vanilagy/mediabunny>.
+`vendor/` holds unmodified builds of `mediabunny` and `@mediabunny/aac-encoder` 1.62.1 (MPL-2.0, see `vendor/README.md`; the AAC encoder is a WebAssembly build of FFmpeg's AAC encoder). Sources: <https://github.com/Vanilagy/mediabunny>.
