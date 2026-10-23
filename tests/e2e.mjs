@@ -560,6 +560,9 @@ await test('phone check page reports support and runs a real encode', async () =
   await page.waitForFunction(() => /Metadata:/.test(document.getElementById('report').textContent), null, { timeout: 30000 });
   const full = await page.textContent('#report');
   assert.match(full, /Audio: opus, 1 ch/); // the fixture tone is mono
+  assert.match(full, /Finished\./);
+  await page.setInputFiles('#file', fx.small); // picking another video works too
+  await page.waitForFunction(() => /small.webm/.test(document.getElementById('report').textContent), null, { timeout: 30000 });
   assert.match(full, /Color: HDR NO/);
   assert.deepEqual(errors, []);
   await ctx.close();

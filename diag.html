@@ -21,6 +21,7 @@
   .btn.primary { background:var(--primary); border-color:var(--primary); color:#fff; }
   .btn[disabled] { opacity:.6; }
   pre { margin:0; padding:12px; background:var(--card); border:1px solid var(--line); border-radius:12px; white-space:pre-wrap; word-break:break-word; font:13px/1.45 ui-monospace,Menlo,Consolas,monospace; min-height:120px; }
+  [hidden] { display:none !important; }
   .vh { position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0 0 0 0); }
 </style>
 </head>
@@ -32,7 +33,7 @@
   <pre id="report" aria-live="polite">Not run yet.</pre>
   <button class="btn" id="copy" type="button" hidden>Copy report</button>
   <input id="file" class="vh" type="file" accept="video/*">
-  <label for="file" class="btn" id="inspect" hidden>Also inspect one of my videos</label>
+  <label for="file" class="btn" id="inspect">Also inspect one of my videos</label>
 </main>
 
 <script type="module">
@@ -134,7 +135,11 @@
   async function inspect(file) {
     add('');
     add(`-- Your video: ${file.name}`);
+    add('Inspecting…');
     render();
+    $('copy').hidden = false;
+    $('report').scrollIntoView({ block: 'end' });
+    try { await file.slice(0, 4096).arrayBuffer(); } catch {} // phones hand over files lazily
     const input = new MB.Input({ source: new MB.BlobSource(file), formats: MB.ALL_FORMATS });
     try {
       add('Size', `${(file.size / 1e6).toFixed(1)} MB, type "${file.type}", last modified ${new Date(file.lastModified).toISOString()}`);
@@ -155,8 +160,12 @@
         const keys = Object.keys(t.raw || {});
         return `recorded ${t.date ? new Date(t.date).toISOString() : 'not found'}; other tags: ${keys.length ? keys.join(', ') : 'none'} (values not shown)`;
       });
+    } catch (e) {
+      add('ERROR', (e && e.message) || e);
     } finally { input.dispose(); }
+    add('Finished.');
     render();
+    $('report').scrollIntoView({ block: 'end' });
   }
 
   $('run').addEventListener('click', run);
@@ -167,7 +176,11 @@
     $('copy').textContent = 'Copied ✓';
     setTimeout(() => ($('copy').textContent = 'Copy report'), 1800);
   });
-  $('file').addEventListener('change', () => { const f = $('file').files[0]; if (f) inspect(f); });
+  $('file').addEventListener('change', async () => {
+    const f = $('file').files[0];
+    if (f) await inspect(f);
+    $('file').value = ''; // so the same video can be picked again
+  });
 </script>
 <script src="version.js"></script>
 </body>
