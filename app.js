@@ -182,7 +182,7 @@ async function analyze(file) {
 }
 
 async function analyzeOnce(file) {
-  const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+  const input = new Input({ source: new BlobSource(file, { useStreamReader: false }), formats: ALL_FORMATS });
   try {
     const video = await input.getPrimaryVideoTrack();
     if (!video) throw new FriendlyError('novideo');
@@ -259,6 +259,25 @@ document.addEventListener('drop', (e) => {
   if (files.length && !$('screen-idle').hidden) onFiles(files);
 });
 
+// Phones can stop letting the page read the other picked videos once the first one has been busy for a while
+// (they then failed with "TypeError: network error"). Copy them into memory now, while they can still be read.
+const COPY_FILE_MAX = 400e6;
+const COPY_TOTAL_MAX = 900e6;
+async function snapshotLaterFiles() {
+  let room = COPY_TOTAL_MAX;
+  for (let i = 1; i < jobs.length; i++) {
+    const f = jobs[i].file;
+    if (f.size > COPY_FILE_MAX || f.size > room) continue; // too big to hold: read it from the phone as usual
+    setWorking('Getting your videos ready…', `Video ${i + 1} of ${jobs.length}`, '');
+    try {
+      jobs[i].source = new File([await f.arrayBuffer()], f.name, { type: f.type });
+      room -= f.size;
+    } catch (e) {
+      console.warn('Could not copy ' + f.name + ' ahead of time', e);
+    }
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Free the file reader of a finished video (its details stay available). */
@@ -278,6 +297,11 @@ async function runJob(i) {
     console.warn('Video failed, trying once more', e);
     releaseJob(job);
     job.outputs = [];
+    if (!job.source && job.file.size <= COPY_FILE_MAX) {
+      try {
+        job.source = new File([await job.file.arrayBuffer()], job.file.name, { type: job.file.type });
+      } catch {}
+    }
     setWorking('Trying that video again…', 'One moment.', jobs.length > 1 ? `Video ${i + 1} of ${jobs.length}` : '');
     await sleep(2500);
     if (cancelled) throw new Cancelled();
@@ -295,6 +319,7 @@ async function onFiles(files) {
   setWorking('Reading your video…', 'This only takes a moment.', '');
   show('work');
   try {
+    await snapshotLaterFiles();
     for (let i = 0; i < jobs.length; i++) {
       try {
         await runJob(i);
@@ -330,7 +355,7 @@ async function processJob(job, index, total) {
   const queue = total > 1 ? `Video ${index + 1} of ${total}` : '';
   setWorking('Reading your video…', 'This only takes a moment.', queue);
   show('work');
-  job.info = await analyze(job.file);
+  job.info = await analyze(job.source || job.file);
   if (cancelled) throw new Cancelled();
   const info = job.info;
 
@@ -414,7 +439,7 @@ function askTrim(job, reason, queue) {
   const info = job.info;
   const limit = limitMB();
   el.trimQueue.textContent = queue;
-  el.trimVideo.src = objectUrl(job.file);
+  el.trimVideo.src = objectUrl(job.source || job.file);
   for (const r of [el.trimStart, el.trimEnd]) {
     r.max = info.duration;
     r.step = info.duration > 30 ? 0.5 : 0.1;

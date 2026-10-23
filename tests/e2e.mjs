@@ -611,6 +611,37 @@ await test('a video that cannot be read at first is retried and still made', asy
   await ctx.close();
 });
 
+await test('later videos still work when the phone stops letting the page read the picked files', async () => {
+  // Originals (older than the page) turn unreadable 2.5 s after the page opened, like Android content files
+  // that fail with "TypeError: network error". Copies made in memory at pick time are not affected.
+  const { ctx, page } = await newPage({
+    init: () => {
+      const t0 = Date.now();
+      // the first video (landscape) is read straight away on a phone, so only the later ones are affected
+      const bad = (blob) => blob.name === 'noaudio.webm' && blob.lastModified < t0 - 1000 && Date.now() - t0 > 2500;
+      const fail = () => Promise.reject(new TypeError('network error'));
+      const slice = Blob.prototype.slice;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (bad(this)) {
+          part.arrayBuffer = fail;
+          part.stream = () => new ReadableStream({ start: (c) => c.error(new TypeError('network error')) });
+        }
+        return part;
+      };
+      const ab = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        return bad(this) ? fail() : ab.call(this);
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 3, 'all three videos made');
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  await ctx.close();
+});
+
 await browser.close();
 server.close();
 const failed = results.filter((r) => !r[1]);
