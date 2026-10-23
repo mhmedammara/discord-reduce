@@ -3,6 +3,8 @@
 import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
+// Must match version.js; bumped together on every release.
+const APP_VERSION = '1.1.20';
 const B = window.DRBudget;
 const { Input, ALL_FORMATS, BlobSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
@@ -16,7 +18,7 @@ const SOFT_BELOW = 480; // asking about trim/split when the picture would drop b
 const $ = (id) => document.getElementById(id);
 const el = Object.fromEntries(
   [
-    'file', 'limit', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
+    'file', 'limit', 'pickHint', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
@@ -76,6 +78,8 @@ let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
 let repick = null; // finished videos kept while the user chooses the skipped ones again
+let leftOver = []; // videos picked beyond what one share can carry
+let lastPickMax = Infinity;
 let wakeLock = null;
 let pendingDecision = null; // { resolve, reject } while the trim screen is open
 let trimJob = null;
@@ -101,11 +105,15 @@ function resetAll(keepInput = false) {
   jobs = [];
   pendingDecision = null;
   trimJob = null;
-  if (!keepInput) repick = null;
+  if (!keepInput) {
+    repick = null;
+    leftOver = [];
+  }
   if (!keepInput) el.file.value = ''; // clearing it early can release the picked file on some phones
 }
 
-const limitMB = () => Number(el.limit.value) || 20;
+const chosenLimitMB = () => Number(el.limit.value) || 20;
+const limitMB = chosenLimitMB;
 const concert = () => true; // these are concert videos: the sound always gets the bigger share
 
 // ---------------------------------------------------------------- screens
@@ -166,7 +174,10 @@ try {
   const saved = store.get('dr-limit');
   if (saved && [...el.limit.options].some((o) => o.value === saved)) el.limit.value = saved;
 } catch {}
-el.limit.addEventListener('change', () => store.set('dr-limit', el.limit.value));
+el.limit.addEventListener('change', () => {
+  store.set('dr-limit', el.limit.value);
+  refreshPickHint();
+});
 
 // ---------------------------------------------------------------- analysis
 
@@ -247,6 +258,61 @@ function makePlan(info, duration, noCopy) {
 
 const needsDecision = (plan) => plan.quality === 'low' || Math.min(plan.width, plan.height) < SOFT_BELOW;
 
+// ---------------------------------------------------------------- how many videos one share can carry
+
+// The browser refuses a share with too many files or megabytes. Ask it what it accepts (stand-in files made of
+// references to one small block, so nothing big is allocated), then never take more videos than fit in one share.
+let shareCapacity = null; // { files, bytes }, or null when there is no share sheet
+
+function probeShareCapacity() {
+  try {
+    if (!navigator.share || !navigator.canShare) return null;
+    const block = new Blob([new Uint8Array(1 << 20)]); // 1 MiB
+    const fileOf = (mb, name = 'probe.mp4') => new File(Array(mb).fill(block), name, { type: 'video/mp4' });
+    const accepts = (files) => navigator.canShare({ files });
+    if (!accepts([fileOf(1)])) return null;
+    let files = 1;
+    while (files < 12 && accepts(Array.from({ length: files + 1 }, (_, i) => fileOf(1, `p${i}.mp4`)))) files++;
+    let ok = 1;
+    let bad = 0;
+    for (let mb = 8; mb <= 512; mb *= 2) {
+      if (accepts([fileOf(mb)])) ok = mb;
+      else {
+        bad = mb;
+        break;
+      }
+    }
+    if (!bad) return { files, bytes: Infinity };
+    while (bad - ok > 1) {
+      const mid = Math.floor((ok + bad) / 2);
+      if (accepts([fileOf(mid)])) ok = mid;
+      else bad = mid;
+    }
+    return { files, bytes: ok * 1048576 };
+  } catch {
+    return null;
+  }
+}
+
+/** How many videos may be picked at once so that all of them go out in one share at full quality. */
+function pickLimit() {
+  if (!shareCapacity || loadHook()) return Infinity; // posting to a thread has no such limit
+  const perVideo = chosenLimitMB() * 1e6 * 0.99; // the most a finished video can weigh
+  const bySize = Number.isFinite(shareCapacity.bytes) ? Math.floor(shareCapacity.bytes / perVideo) : Infinity;
+  return Math.max(1, Math.min(shareCapacity.files, bySize));
+}
+
+function refreshPickHint() {
+  const max = pickLimit();
+  el.pickHint.hidden = !Number.isFinite(max);
+  if (Number.isFinite(max)) {
+    el.pickHint.textContent =
+      max === 1
+        ? 'This phone sends one video per share, so pick one at a time.'
+        : `This phone sends up to ${max} videos in one share, so pick up to ${max} at a time.`;
+  }
+}
+
 // ---------------------------------------------------------------- picking files
 
 el.file.addEventListener('change', () => onFiles([...(el.file.files || [])]));
@@ -268,23 +334,21 @@ document.addEventListener('drop', (e) => {
   if (files.length && !$('screen-idle').hidden) onFiles(files);
 });
 
-// Phones only let the page read a picked file for a short while after it was picked (later videos of a list
-// failed with "The requested file could not be read ... permission problems"). So when several videos are
-// picked, reading ALL of them starts at once, in the same instant as the pick, and the copies are kept in memory.
-// The copies are Files, which the browser keeps in its own blob storage and pages out to disk when memory is
-// short, so only an extreme list needs a ceiling. (An earlier, much lower ceiling made the last videos of a
-// list of seven fail.) Chrome reports the phone's memory; Safari does not, so assume less.
-const MEMORY_GB = navigator.deviceMemory || 2;
-const COPY_TOTAL_MAX = Math.min(2e9, MEMORY_GB * 500e6); // a 4 GB phone: 2 GB
-const COPY_FILE_MAX = Math.min(1e9, COPY_TOTAL_MAX);
+// Phones only let the page read a picked video for a short while after it was picked (later videos failed with
+// "The requested file could not be read ... permission problems"). So every picked video, even a single one,
+// is read in full at the instant of the pick, all at once, and only that copy is used afterwards. The copies
+// are Files, which the browser keeps in its own storage (paged to disk when memory is short).
+const COPY_FILE_MAX = 1.5e9;
+const COPY_TOTAL_MAX = 3e9;
 function startCopies(files) {
   let room = COPY_TOTAL_MAX;
   return files.map((f) => {
-    if (f.size > COPY_FILE_MAX || f.size > room) return null; // too big to hold: it is read from the phone as usual
+    if (f.size > COPY_FILE_MAX || f.size > room) return null; // only an extreme pick is too big to hold
     room -= f.size;
+    const t0 = performance.now();
     return f.arrayBuffer().then(
-      (buf) => new File([buf], f.name, { type: f.type }),
-      (error) => ({ error }),
+      (buf) => ({ file: new File([buf], f.name, { type: f.type }), ms: performance.now() - t0 }),
+      (error) => ({ error, ms: performance.now() - t0 }),
     );
   });
 }
@@ -292,11 +356,16 @@ function startCopies(files) {
 async function attachCopies(copies, offset) {
   setWorking('Getting your videos ready…', 'One moment.', '');
   for (let i = 0; i < copies.length; i++) {
-    const r = copies[i] && (await copies[i]);
-    if (!r) continue;
     const job = jobs[offset + i];
-    if (r instanceof File) job.source = r;
-    else job.diag = `Copy at pick time failed: ${r.error && r.error.name}: ${r.error && r.error.message}`;
+    const r = copies[i] && (await copies[i]);
+    if (!r) {
+      job.diag = 'Not copied when picked (too big to hold).';
+    } else if (r.file) {
+      job.source = r.file;
+      job.diag = `Copied when picked: ${B.formatBytes(r.file.size)} in ${(r.ms / 1000).toFixed(1)} s.`;
+    } else {
+      job.diag = `Copy when picked failed after ${(r.ms / 1000).toFixed(1)} s: ${r.error && r.error.name}: ${r.error && r.error.message}`;
+    }
   }
 }
 
@@ -337,9 +406,14 @@ async function runJob(i) {
   }
 }
 
-async function onFiles(files) {
-  if (busy || !files.length) return;
-  const copies = files.length > 1 ? startCopies(files) : []; // first thing: the phone's permission is short-lived
+async function onFiles(picked) {
+  if (busy || !picked.length) return;
+  // First thing, before anything else can take time: keep only what fits in one share, and start reading it.
+  const max = pickLimit();
+  const files = picked.slice(0, max);
+  leftOver = picked.slice(max);
+  lastPickMax = max;
+  const copies = startCopies(files); // the phone's permission to read a picked video is short-lived
   busy = true;
   cancelled = false;
   const kept = repick || [];
@@ -790,6 +864,12 @@ function finishAll() {
     el.doneSizes.append(a, arrow, b);
   }
   const notes = [...new Set(outputs.map((o) => o.out.note).filter(Boolean))];
+  if (leftOver.length) {
+    notes.unshift(
+      `Your phone sends ${lastPickMax} ${lastPickMax === 1 ? 'video' : 'videos'} per share, so only the first ${lastPickMax} ${lastPickMax === 1 ? 'was' : 'were'} done. ` +
+        `Not done yet: ${leftOver.map((f) => f.name).join(', ')}. Pick ${leftOver.length === 1 ? 'it' : 'them'} next.`,
+    );
+  }
   el.doneNote.hidden = !notes.length;
   el.doneNote.textContent = notes.join(' ');
 
@@ -958,6 +1038,7 @@ let pendingHook = null;
 
 function refreshHookStatus() {
   const saved = loadHook();
+  if (shareCapacity) refreshPickHint();
   el.hookStatus.hidden = !saved;
   if (saved) el.hookThread.textContent = 'thread ' + describeHook(saved);
   const asking = pendingHook && !sameHook(pendingHook, saved);
@@ -987,7 +1068,21 @@ el.hookForget.addEventListener('click', () => {
 
 async function boot() {
   window.__drBooted = true;
-  el.version.textContent = 'v' + window.DR_VERSION;
+  // The code and the version file must be from the same release. If an old copy of one was served, reload once.
+  if (window.DR_VERSION !== APP_VERSION) {
+    let tried = null;
+    try {
+      tried = sessionStorage.getItem('dr-version-reload');
+      sessionStorage.setItem('dr-version-reload', String(window.DR_VERSION) + '/' + APP_VERSION);
+    } catch {}
+    if (tried !== String(window.DR_VERSION) + '/' + APP_VERSION) {
+      location.reload();
+      return;
+    }
+  }
+  shareCapacity = probeShareCapacity();
+  refreshPickHint();
+  el.version.textContent = 'v' + APP_VERSION; // the version of the code that is actually running
   pendingHook = captureHookFromLocation();
   refreshHookStatus();
 

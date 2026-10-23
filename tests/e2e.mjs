@@ -673,7 +673,7 @@ await test('videos the phone will not share are skipped, then chosen again with 
   await visible(page, 'done');
   assert.equal(await page.locator('#results .item video').count(), 1, 'the readable video is made');
   assert.match(await page.textContent('#results .status.err'), /stopped sharing/);
-  assert.match(await page.textContent('#results details pre'), /Copy at pick time failed: NotReadableError/); // there, but collapsed
+  assert.match(await page.textContent('#results details pre'), /Copy when picked failed after [\d.]+ s: NotReadableError/); // there, but collapsed
   assert.equal(await page.isVisible('#results details pre'), false);
   assert.match(await page.textContent('#repickBtn'), /Choose the skipped video again/);
   await shot(page, '10-skipped');
@@ -733,33 +733,6 @@ await test('a phone with little memory copies fewer videos but still makes them 
   await ctx.close();
 });
 
-await test('a long list is shared in batches the browser accepts', async () => {
-  // A browser that takes at most 2 files / 25 MB per share, like Chrome's limits on a phone.
-  const { ctx, page } = await newPage({
-    init: () => {
-      window.__shares = [];
-      const ok = (d) => d.files.length <= 2 && d.files.reduce((n, f) => n + f.size, 0) <= 25e6;
-      navigator.canShare = (d) => !!d && !!d.files && ok(d);
-      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
-    },
-  });
-  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
-  await visible(page, 'done');
-  assert.equal(await page.isVisible('#shareBtn'), true, 'share button is there');
-  assert.equal(await page.textContent('#shareBtn'), 'Send videos 1–2 of 3');
-  await page.click('#shareBtn');
-  assert.match(await page.textContent('#shareStatus'), /Sent 2 of 3\. Tap the button again/);
-  assert.equal(await page.textContent('#shareBtn'), 'Send video 3 of 3');
-  await page.click('#shareBtn');
-  assert.equal(await page.textContent('#shareBtn'), 'All sent ✓');
-  assert.equal(await page.textContent('#shareStatus'), 'All 3 sent.');
-  const shares = await page.evaluate(() => window.__shares);
-  assert.equal(shares.length, 2, JSON.stringify(shares));
-  assert.ok(shares.every((g) => g.length <= 2), JSON.stringify(shares));
-  assert.equal(shares.flat().length, await page.locator('#results .item video').count(), 'every video was offered once');
-  await ctx.close();
-});
-
 await test('a new release shows up on the very next visit (the offline cache is not sticky)', async () => {
   // Serve a copy of the site the way GitHub Pages does: the browser may reuse any file for 10 minutes.
   const dir = fs.mkdtempSync(path.join(work, 'site-'));
@@ -780,7 +753,9 @@ await test('a new release shows up on the very next visit (the offline cache is 
     const first = (await page.textContent('#version')).trim();
     await page.evaluate(() => navigator.serviceWorker.ready);
     await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 10000 });
-    fs.writeFileSync(path.join(dir, 'version.js'), "var DR_VERSION = '9.9.9';\n"); // a release
+    // a release: both the version file and the code change
+    fs.writeFileSync(path.join(dir, 'version.js'), "var DR_VERSION = '9.9.9';\n");
+    fs.writeFileSync(path.join(dir, 'app.js'), fs.readFileSync(path.join(dir, 'app.js'), 'utf8').replace(/const APP_VERSION = '[^']*'/, "const APP_VERSION = '9.9.9'"));
     await page.reload();
     assert.equal((await page.textContent('#version')).trim(), 'v9.9.9', `still showing ${first} after one reload`);
     let keys = [];
@@ -791,6 +766,94 @@ await test('a new release shows up on the very next visit (the offline cache is 
     }
     assert.ok(keys.includes('dr-9.9.9'), 'the new offline copy is stored: ' + keys);
     assert.ok(!keys.includes('dr-' + first.slice(1)), 'the old offline copy is removed: ' + keys);
+  } finally {
+    await ctx.close();
+    srv.close();
+  }
+});
+
+await test('picking more than one share can carry: only that many are taken, and the rest are named', async () => {
+  // A browser that accepts at most 3 files and 45 MiB per share: with a 20 MB limit that is 2 videos.
+  const { ctx, page } = await newPage({
+    init: () => {
+      window.__shares = [];
+      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 45 * 1048576;
+      navigator.canShare = (d) => !!d && !!d.files && ok(d);
+      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
+    },
+  });
+  await page.selectOption('#limit', '20');
+  assert.equal(await page.textContent('#pickHint'), 'This phone sends up to 2 videos in one share, so pick up to 2 at a time.');
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item').count(), 2);
+  assert.match(await page.textContent('#doneNote'), /only the first 2 were done\. Not done yet: portrait\.mp4\. Pick it next\./);
+  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet');
+  await page.click('#shareBtn');
+  const shares = await page.evaluate(() => window.__shares);
+  assert.deepEqual(shares.map((g) => g.length), [2], 'everything in one share');
+  await page.click('#againBtn');
+  await page.selectOption('#limit', '10'); // a smaller limit fits more per share
+  assert.match(await page.textContent('#pickHint'), /up to 3 videos/);
+  await ctx.close();
+});
+
+await test('a single video is copied at the moment it is picked', async () => {
+  // The original turns unreadable 1.5 s after the pick, long before the 25 s video is finished.
+  const { ctx, page } = await newPage({
+    init: () => {
+      let tPick = 0;
+      document.addEventListener('change', (e) => { if (e.target.id === 'file') tPick = Date.now(); }, true);
+      const t0 = Date.now();
+      const bad = (blob) => tPick && blob.lastModified < t0 - 1000 && Date.now() - tPick > 1500;
+      const err = () => new DOMException('The requested file could not be read, typically due to permission problems that have occurred after a reference to a file was acquired.', 'NotReadableError');
+      const slice = Blob.prototype.slice;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (bad(this)) {
+          part.arrayBuffer = () => Promise.reject(err());
+          part.stream = () => new ReadableStream({ start: (c) => c.error(err()) });
+        }
+        return part;
+      };
+      const ab = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        return bad(this) ? Promise.reject(err()) : ab.call(this);
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 1);
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  const out = await save(page, 'out-single-copied.mp4');
+  checkShrunk(out, { limitMB: 10, duration: 25, audio: true });
+  await ctx.close();
+});
+
+await test('a stale version file never mixes with new code: the page reloads once and runs', async () => {
+  const dir = fs.mkdtempSync(path.join(work, 'mix-'));
+  for (const f of ['index.html', 'app.js', 'budget.js', 'discord.mjs', 'version.js', 'sw.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-180.png']) fs.copyFileSync(path.join(root, f), path.join(dir, f));
+  fs.cpSync(path.join(root, 'vendor'), path.join(dir, 'vendor'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'version.js'), "var DR_VERSION = '0.0.1';\n"); // does not match the code
+  const srv = http.createServer((req, res) => {
+    const p = path.join(dir, decodeURIComponent(new URL(req.url, 'http://x').pathname).replace(/\/$/, '/index.html'));
+    if (!p.startsWith(dir) || !fs.existsSync(p) || fs.statSync(p).isDirectory()) return res.writeHead(404).end();
+    res.writeHead(200, { 'content-type': MIME[path.extname(p)] || 'application/octet-stream' });
+    fs.createReadStream(p).pipe(res);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const ctx = await browser.newContext({ ...devices['Pixel 7'] });
+  const page = await ctx.newPage();
+  // count every document that starts (a reload during start-up never reaches its 'load' event)
+  await page.addInitScript(() => sessionStorage.setItem('docs', String(Number(sessionStorage.getItem('docs') || 0) + 1)));
+  try {
+    await page.goto(`http://localhost:${srv.address().port}/`);
+    await page.waitForTimeout(2500);
+    const docs = Number(await page.evaluate(() => sessionStorage.getItem('docs')));
+    assert.equal(docs, 2, `reloaded once, not in a loop (${docs} starts)`);
+    assert.match(await page.textContent('#version'), /^v1\./);
+    assert.equal(await page.isVisible('#screen-idle'), true);
   } finally {
     await ctx.close();
     srv.close();
