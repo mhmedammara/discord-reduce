@@ -28,12 +28,14 @@
 <body>
 <main>
   <h1>Phone check</h1>
+  <p class="muted small" id="pageVersion"></p>
   <p class="muted">This tests whether your phone can shrink videos and shows what it supports. It doesn't upload anything. When it finishes, tap <b>Copy report</b> and paste it to whoever asked you to run it.</p>
   <button class="btn primary" id="run" type="button">Run the check</button>
   <pre id="report" aria-live="polite">Not run yet.</pre>
   <button class="btn" id="copy" type="button" hidden>Copy report</button>
   <input id="file" class="vh" type="file" accept="video/*">
-  <label for="file" class="btn" id="inspect">Also inspect one of my videos</label>
+  <button class="btn" id="inspect" type="button">Also inspect one of my videos</button>
+  <p class="muted small" id="inspectStatus" aria-live="polite"></p>
 </main>
 
 <script type="module">
@@ -176,11 +178,24 @@
     $('copy').textContent = 'Copied ✓';
     setTimeout(() => ($('copy').textContent = 'Copy report'), 1800);
   });
-  $('file').addEventListener('change', async () => {
-    const f = $('file').files[0];
-    if (f) await inspect(f);
-    $('file').value = ''; // so the same video can be picked again
-  });
+  const status = (text) => { $('inspectStatus').textContent = text; };
+  let inspecting = false;
+  async function onPick() {
+    const f = $('file').files && $('file').files[0];
+    if (!f || inspecting) return;
+    inspecting = true;
+    status(`Reading ${f.name}… (this can take a little while for big videos)`);
+    try { await inspect(f); status('Done. The details are at the bottom of the report above. Tap Copy report.'); }
+    catch (e) { add('ERROR', (e && e.message) || e); render(); status('Something went wrong. See the end of the report.'); }
+    finally { inspecting = false; $('file').value = ''; } // so the same video can be picked again
+  }
+  $('inspect').addEventListener('click', () => { status('Choose a video…'); $('file').click(); });
+  $('file').addEventListener('change', onPick);
+  $('file').addEventListener('input', onPick);
+  $('pageVersion').textContent = 'Page version ' + (window.DR_VERSION || '?');
+  // Anything unexpected is written into the report so it can be copied and shared.
+  window.addEventListener('error', (e) => { add('PAGE ERROR', e.message); render(); });
+  window.addEventListener('unhandledrejection', (e) => { add('PAGE ERROR', (e.reason && e.reason.message) || e.reason); render(); });
 </script>
 <script src="version.js"></script>
 </body>

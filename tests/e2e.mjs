@@ -556,8 +556,10 @@ await test('phone check page reports support and runs a real encode', async () =
   const report = await page.textContent('#report');
   for (const needle of ['Browser:', 'VideoEncoder present: yes', 'AAC encode', 'Bundled AAC encoder loads: yes', 'Share files:', 'frames of 720p']) assert.ok(report.includes(needle), `missing "${needle}" in\n${report}`);
   await shot(page, '8-diag');
-  await page.setInputFiles('#file', fx.landscape);
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser', { timeout: 5000 }), page.click('#inspect')]); // a real tap on the button
+  await chooser.setFiles(fx.landscape);
   await page.waitForFunction(() => /Metadata:/.test(document.getElementById('report').textContent), null, { timeout: 30000 });
+  assert.match(await page.textContent('#inspectStatus'), /Done/);
   const full = await page.textContent('#report');
   assert.match(full, /Audio: opus, 1 ch/); // the fixture tone is mono
   assert.match(full, /Finished\./);
