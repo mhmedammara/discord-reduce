@@ -271,8 +271,10 @@ document.addEventListener('drop', (e) => {
 // Phones only let the page read a picked file for a short while after it was picked (later videos of a list
 // failed with "The requested file could not be read ... permission problems"). So when several videos are
 // picked, reading ALL of them starts at once, in the same instant as the pick, and the copies are kept in memory.
-const COPY_FILE_MAX = 400e6;
-const COPY_TOTAL_MAX = 900e6;
+// How much may be held at once depends on the phone's memory (Chrome reports it; Safari does not, so assume little).
+const MEMORY_GB = navigator.deviceMemory || 2;
+const COPY_TOTAL_MAX = Math.min(800e6, MEMORY_GB * 100e6); // a 4 GB phone holds up to 400 MB of copies
+const COPY_FILE_MAX = Math.min(250e6, COPY_TOTAL_MAX);
 function startCopies(files) {
   let room = COPY_TOTAL_MAX;
   return files.map((f) => {
@@ -356,6 +358,8 @@ async function onFiles(files) {
         jobs[i].error = e;
       }
       releaseJob(jobs[i]);
+      // Give the memory back as soon as a video is finished (unless the copy itself is the result).
+      if (jobs[i].source && !jobs[i].outputs.some((o) => o.file === jobs[i].source)) jobs[i].source = null;
       if (i < jobs.length - 1) {
         // Give the phone a moment to free what this video used before the next one starts.
         setWorking('Getting ready for the next video…', 'One moment.', `Video ${i + 2} of ${jobs.length}`);
@@ -797,12 +801,9 @@ function finishAll() {
   el.postBtn.disabled = false;
   el.postBtn.textContent = outputs.length > 1 ? 'Post all to the thread' : 'Post to the thread';
   el.posterName.value = store.get('dr-name') || '';
-  let canShare = false;
-  try {
-    const files = outputs.map((o) => o.out.file);
-    canShare = !!(navigator.canShare && navigator.share && files.length && navigator.canShare({ files }));
-  } catch {}
-  el.shareBtn.hidden = !canShare;
+  shareNext = 0;
+  updateShareButton();
+  const canShare = !el.shareBtn.hidden;
   el.shareBtn.classList.toggle('primary', canShare && !hook);
   el.saveBtn.classList.toggle('primary', !canShare && !hook);
   el.saveBtn.textContent = canShare ? 'Save to my device' : 'Download';
@@ -852,15 +853,66 @@ el.postBtn.addEventListener('click', async () => {
   }
 });
 
-el.shareBtn.addEventListener('click', async () => {
-  const files = flat().map((o) => o.out.file);
-  if (!files.length) return;
+// A browser only lets one share carry a limited number of files and megabytes, so a long list goes out in
+// batches: one tap per batch. A batch is made as large as the browser accepts.
+const SHARE_MAX_FILES = 8;
+const SHARE_MAX_BYTES = 40e6;
+let shareNext = 0; // index of the first video not yet sent
+
+function nextShareBatch() {
+  const items = flat();
+  const batch = [];
+  let bytes = 0;
+  for (let i = shareNext; i < items.length && batch.length < SHARE_MAX_FILES; i++) {
+    const size = items[i].out.file.size;
+    if (batch.length && bytes + size > SHARE_MAX_BYTES) break;
+    batch.push(items[i].out.file);
+    bytes += size;
+  }
   try {
-    await navigator.share({ files });
+    while (batch.length > 1 && !navigator.canShare({ files: batch })) batch.pop();
+    if (!navigator.canShare({ files: batch })) return { items, batch: [] };
+  } catch {
+    return { items, batch: [] };
+  }
+  return { items, batch };
+}
+
+function updateShareButton() {
+  const { items, batch } = nextShareBatch();
+  el.shareBtn.disabled = false;
+  if (!navigator.share || !navigator.canShare || !items.length) {
+    el.shareBtn.hidden = true;
+  } else if (shareNext >= items.length) {
+    el.shareBtn.hidden = false;
+    el.shareBtn.disabled = true;
+    el.shareBtn.textContent = 'All sent ✓';
+  } else if (!batch.length) {
+    el.shareBtn.hidden = true;
+  } else {
+    el.shareBtn.hidden = false;
+    const from = shareNext + 1;
+    const to = shareNext + batch.length;
+    el.shareBtn.textContent =
+      items.length === batch.length
+        ? 'Send with the share sheet'
+        : from === to
+          ? `Send video ${from} of ${items.length}`
+          : `Send videos ${from}–${to} of ${items.length}`;
+  }
+}
+
+el.shareBtn.addEventListener('click', async () => {
+  const { batch } = nextShareBatch();
+  if (!batch.length) return;
+  try {
+    await navigator.share({ files: batch });
+    shareNext += batch.length;
+    updateShareButton();
   } catch (e) {
     if (e && e.name === 'AbortError') return;
     el.doneNote.hidden = false;
-    el.doneNote.textContent = "Sharing didn't work. Tap Save to my device, then attach the video in Discord.";
+    el.doneNote.textContent = "Sharing didn't work. Tap Save to my device, then attach the videos in Discord.";
   }
 });
 

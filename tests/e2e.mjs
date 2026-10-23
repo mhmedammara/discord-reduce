@@ -153,6 +153,7 @@ async function saveAll(page, count, prefix) {
 }
 
 async function test(name, fn) {
+  if (process.env.E2E_ONLY && !name.includes(process.env.E2E_ONLY)) return; // run a single test while developing
   const t0 = Date.now();
   try {
     await fn();
@@ -718,6 +719,40 @@ await test('a phone that only lets the page read picked files for 1.5 s still ge
   const files = await saveAll(page, 4, 'out-expiry');
   assert.equal(files.length, 4);
   for (const f of files) assert.ok(fs.statSync(f.out).size > 10_000, f.name + ' is not empty');
+  await ctx.close();
+});
+
+await test('a phone with little memory copies fewer videos but still makes them all', async () => {
+  const { ctx, page } = await newPage({ init: () => Object.defineProperty(navigator, 'deviceMemory', { value: 0.25 }) });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 3);
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  await ctx.close();
+});
+
+await test('a long list is shared in batches the browser accepts', async () => {
+  // A browser that takes at most 2 files / 25 MB per share, like Chrome's limits on a phone.
+  const { ctx, page } = await newPage({
+    init: () => {
+      window.__shares = [];
+      const ok = (d) => d.files.length <= 2 && d.files.reduce((n, f) => n + f.size, 0) <= 25e6;
+      navigator.canShare = (d) => !!d && !!d.files && ok(d);
+      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
+  await visible(page, 'done');
+  assert.equal(await page.isVisible('#shareBtn'), true, 'share button is there');
+  assert.equal(await page.textContent('#shareBtn'), 'Send videos 1–2 of 3');
+  await page.click('#shareBtn');
+  assert.equal(await page.textContent('#shareBtn'), 'Send video 3 of 3');
+  await page.click('#shareBtn');
+  assert.equal(await page.textContent('#shareBtn'), 'All sent ✓');
+  const shares = await page.evaluate(() => window.__shares);
+  assert.equal(shares.length, 2, JSON.stringify(shares));
+  assert.ok(shares.every((g) => g.length <= 2), JSON.stringify(shares));
+  assert.equal(shares.flat().length, await page.locator('#results .item video').count(), 'every video was offered once');
   await ctx.close();
 });
 
