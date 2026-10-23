@@ -20,7 +20,7 @@ const el = Object.fromEntries(
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
-    'doneTitle', 'doneSizes', 'results', 'doneNote', 'speedLog', 'speedCopy',
+    'doneTitle', 'doneSizes', 'results', 'doneNote',
     'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
     'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
   ].map((id) => [id, $(id)]),
@@ -62,17 +62,6 @@ const store = {
   },
 };
 
-// ---------------------------------------------------------------- speed log
-// A short plain-text record of where the time went, shown (collapsed) on the finished screen so slow
-// cases can be copied and reported.
-
-let perfLines = [];
-let perfStart = 0;
-const secs = (ms) => (ms / 1000).toFixed(1) + ' s';
-function perf(line) {
-  perfLines.push(`[${secs(performance.now() - perfStart)}] ${line}`);
-}
-
 // ---------------------------------------------------------------- state
 
 let jobs = []; // one per picked file: { file, info, outputs: [], error }
@@ -80,8 +69,6 @@ let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
 let wakeLock = null;
-let pendingHook = null; // a thread link waiting for the user's OK
-let reloadWhenIdle = false;
 let pendingDecision = null; // { resolve, reject } while the trim screen is open
 let trimJob = null;
 const urls = new Set();
@@ -97,15 +84,6 @@ function resetAll(keepInput = false) {
   urls.clear();
   el.trimVideo.removeAttribute('src');
   el.trimVideo.load();
-  // Preview players hold on to the phone's few hardware video decoders until released; free them before the
-  // next video needs one.
-  for (const v of document.querySelectorAll('#results video, #trimVideo')) {
-    try {
-      v.pause();
-      v.removeAttribute('src');
-      v.load();
-    } catch {}
-  }
   el.results.replaceChildren();
   for (const j of jobs) {
     try {
@@ -123,17 +101,11 @@ const concert = () => true; // these are concert videos: the sound always gets t
 
 // ---------------------------------------------------------------- screens
 
-function maybeReload() {
-  const onIdle = !$('screen-idle').hidden;
-  if (reloadWhenIdle && onIdle && !busy && !pendingHook) location.reload();
-}
-
 function show(name) {
   for (const s of document.querySelectorAll('[data-screen]')) s.hidden = s.id !== 'screen-' + name;
   const heading = document.querySelector(`#screen-${name} h1, #screen-${name} h2`);
   if (heading) heading.focus({ preventScroll: true });
   window.scrollTo(0, 0);
-  if (name === 'idle') maybeReload();
 }
 
 function describeError(e) {
@@ -245,8 +217,7 @@ async function analyzeOnce(file) {
       audio = null;
       audioLost = true;
     }
-    const codec = await video.getCodec().catch(() => '?');
-    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio, audioLost, hdr, codec };
+    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio, audioLost, hdr };
   } catch (e) {
     input.dispose();
     throw e instanceof FriendlyError ? e : new FriendlyError('unreadable', e);
@@ -294,9 +265,6 @@ async function onFiles(files) {
   cancelled = false;
   resetAll(true);
   jobs = files.map((file) => ({ file, info: null, outputs: [], error: null }));
-  perfLines = [];
-  perfStart = performance.now();
-  perf(`Version ${window.DR_VERSION}; ${navigator.userAgent}`);
   keepAwake();
   setWorking('Reading your video…', 'This only takes a moment.', '');
   show('work');
@@ -329,9 +297,7 @@ async function processJob(job, index, total) {
   const queue = total > 1 ? `Video ${index + 1} of ${total}` : '';
   setWorking('Reading your video…', 'This only takes a moment.', queue);
   show('work');
-  const tRead = performance.now();
   job.info = await analyze(job.file);
-  perf(`Read ${job.file.name}: ${secs(performance.now() - tRead)}; ${B.formatBytes(job.file.size)}, ${job.info.codec}, ${job.info.width}x${job.info.height} @${job.info.fps.toFixed(1)} fps, ${B.formatDuration(job.info.duration)}, audio ${job.info.audio ? job.info.audio.codec + ' ' + Math.round((job.info.audio.bitrate || 0) / 1000) + ' kbps' : 'none'}, HDR ${job.info.hdr}`);
   if (cancelled) throw new Cancelled();
   const info = job.info;
 
@@ -567,20 +533,6 @@ async function encodeOnce(info, plan, trim, onProgress, probe = false) {
   return { buffer: output.target.buffer, videoCodec };
 }
 
-/** A failed pass is retried once after a moment: the phone's hardware encoder/decoder may still be freeing up. */
-async function encodeWithRetry(info, plan, trim, onProgress, probe = false) {
-  try {
-    return await encodeOnce(info, plan, trim, onProgress, probe);
-  } catch (e) {
-    if (e instanceof Cancelled || e instanceof FriendlyError) throw e;
-    perf(`Encoding failed (${(e && e.message) || e}); trying once more`);
-    console.warn('Encoding failed, retrying once', e);
-    await new Promise((r) => setTimeout(r, 1500));
-    if (cancelled) throw new Cancelled();
-    return encodeOnce(info, plan, trim, onProgress, probe);
-  }
-}
-
 function progressReporter() {
   const started = performance.now();
   return (p) => {
@@ -606,12 +558,8 @@ async function encodeSegment(job, seg, part, queue) {
     const sample = { start: from, end: from + PROBE_SECONDS };
     const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
     try {
-      const tProbe = performance.now();
-      const probed = await encodeWithRetry(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
-      const measured = (probed.buffer.byteLength * 8) / PROBE_SECONDS;
-      const before = videoBps;
-      videoBps = B.calibrate(videoBps, measured);
-      perf(`Sample pass ${PROBE_SECONDS}s of ${layout.width}x${layout.height}: ${secs(performance.now() - tProbe)} (${(PROBE_SECONDS / ((performance.now() - tProbe) / 1000)).toFixed(1)}x realtime); asked ${Math.round(before / 1000)} kbps, got ${Math.round(measured / 1000)} kbps, next ${Math.round(videoBps / 1000)} kbps, ${probed.videoCodec}`);
+      const probed = await encodeOnce(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
+      videoBps = B.calibrate(videoBps, (probed.buffer.byteLength * 8) / PROBE_SECONDS);
     } catch (e) {
       if (e instanceof Cancelled || (e instanceof FriendlyError && e.code === 'cantEncode')) throw e;
       console.warn('Sample pass failed, continuing without it', e);
@@ -626,10 +574,7 @@ async function encodeSegment(job, seg, part, queue) {
       attempt === 1 ? `Making it ${Math.min(layout.width, layout.height)}p to fit ${limitMB()} MB.` : 'Almost there. Making it a little smaller…',
       label,
     );
-    const tPass = performance.now();
-    const out = await encodeWithRetry(info, attemptPlan, seg, progressReporter());
-    const passSecs = (performance.now() - tPass) / 1000;
-    perf(`Pass ${attempt}${part ? ` (part ${part.index}/${part.count})` : ''}: ${layout.width}x${layout.height} @${layout.fps} fps, asked ${Math.round(videoBps / 1000)} kbps; took ${passSecs.toFixed(1)} s for ${B.formatDuration(length)} of video (${(length / passSecs).toFixed(1)}x realtime); result ${B.formatBytes(out.buffer.byteLength)} ${out.buffer.byteLength <= plan.acceptBytes ? 'fits' : 'TOO BIG, redoing'}`);
+    const out = await encodeOnce(info, attemptPlan, seg, progressReporter());
     if (out.buffer.byteLength <= plan.acceptBytes) {
       setProgress(1);
       const file = new File([out.buffer], outputName(info.file.name, part), { type: 'video/mp4', lastModified: Date.now() });
@@ -681,7 +626,7 @@ function addCard(job, out) {
   const video = document.createElement('video');
   video.controls = true;
   video.playsInline = true;
-  video.preload = 'none'; // do not hold one of the phone's few hardware decoders until someone presses play
+  video.preload = 'metadata';
   video.src = objectUrl(out.file);
   const status = document.createElement('p');
   status.className = 'small status';
@@ -698,8 +643,6 @@ function setStatus(out, text, kind) {
 }
 
 function finishAll() {
-  perf('All done');
-  el.speedLog.textContent = perfLines.join('\n');
   const ok = jobs.filter((j) => !j.error);
   const failed = jobs.filter((j) => j.error);
   const outputs = flat();
@@ -831,8 +774,6 @@ el.saveBtn.addEventListener('click', async () => {
   }
 });
 
-el.speedCopy.addEventListener('click', async () => flash(el.speedCopy, (await copyText(el.speedLog.textContent)) ? 'Copied ✓' : "Couldn't copy"));
-
 el.againBtn.addEventListener('click', () => {
   resetAll();
   show('idle');
@@ -846,6 +787,7 @@ el.errCopy.addEventListener('click', async () => flash(el.errCopy, (await copyTe
 // ---------------------------------------------------------------- thread link
 
 // A setup link is only a request to connect: anyone can make one, so nothing is saved until the user agrees.
+let pendingHook = null;
 
 function refreshHookStatus() {
   const saved = loadHook();
@@ -864,12 +806,10 @@ el.hookConnect.addEventListener('click', () => {
   if (pendingHook) saveHook(pendingHook);
   pendingHook = null;
   refreshHookStatus();
-  maybeReload();
 });
 el.hookIgnore.addEventListener('click', () => {
   pendingHook = null;
   refreshHookStatus();
-  maybeReload();
 });
 el.hookForget.addEventListener('click', () => {
   forgetHook();
@@ -889,16 +829,7 @@ async function boot() {
   const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   if (ios && !/Safari\//.test(ua)) el.inAppBanner.hidden = false;
 
-  if ('serviceWorker' in navigator) {
-    // When an update takes over, reload once (when nothing is in progress) so everyone runs the new version.
-    const hadController = !!navigator.serviceWorker.controller;
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (!hadController) return; // first install: nothing stale to replace
-      reloadWhenIdle = true;
-      maybeReload();
-    });
-    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
-  }
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 
   let problem = null;
   if (!window.isSecureContext) problem = 'insecure';

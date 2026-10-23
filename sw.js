@@ -1,4 +1,4 @@
-// Offline support (v2: always revalidates, so updates show up on the next visit): keeps the page and its scripts on the phone so it opens (and shrinks) without a signal.
+// Offline support: keeps the page and its scripts on the phone so it opens (and shrinks) without a signal.
 // Pages and scripts are fetched from the network first, so a new release shows up on the next visit.
 importScripts('version.js');
 
@@ -12,9 +12,8 @@ const HEAVY = ['vendor/mediabunny-aac-encoder.min.mjs']; // only some iPhones ne
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE).then(async (cache) => {
-      // 'reload' skips the browser's own cache, so a new release never stores stale copies.
-      await Promise.all(CORE.map((url) => cache.add(new Request(url, { cache: 'reload' }))));
-      await Promise.all(HEAVY.map((url) => cache.add(new Request(url, { cache: 'reload' })).catch(() => {})));
+      await cache.addAll(CORE);
+      await Promise.all(HEAVY.map((url) => cache.add(url).catch(() => {})));
     }),
   );
   self.skipWaiting();
@@ -43,8 +42,7 @@ self.addEventListener('fetch', (event) => {
         if (hit) return hit;
       }
       try {
-        // 'no-cache' = always ask the server whether the file changed (cheap when it hasn't).
-        const res = await fetch(req.mode === 'navigate' ? req.url : req, { cache: 'no-cache' });
+        const res = await fetch(req);
         if (res.ok && res.type === 'basic') cache.put(req, res.clone());
         return res;
       } catch (e) {
