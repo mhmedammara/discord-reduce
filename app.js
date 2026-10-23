@@ -80,6 +80,8 @@ let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
 let wakeLock = null;
+let pendingHook = null; // a thread link waiting for the user's OK
+let reloadWhenIdle = false;
 let pendingDecision = null; // { resolve, reject } while the trim screen is open
 let trimJob = null;
 const urls = new Set();
@@ -95,6 +97,15 @@ function resetAll(keepInput = false) {
   urls.clear();
   el.trimVideo.removeAttribute('src');
   el.trimVideo.load();
+  // Preview players hold on to the phone's few hardware video decoders until released; free them before the
+  // next video needs one.
+  for (const v of document.querySelectorAll('#results video, #trimVideo')) {
+    try {
+      v.pause();
+      v.removeAttribute('src');
+      v.load();
+    } catch {}
+  }
   el.results.replaceChildren();
   for (const j of jobs) {
     try {
@@ -112,11 +123,17 @@ const concert = () => true; // these are concert videos: the sound always gets t
 
 // ---------------------------------------------------------------- screens
 
+function maybeReload() {
+  const onIdle = !$('screen-idle').hidden;
+  if (reloadWhenIdle && onIdle && !busy && !pendingHook) location.reload();
+}
+
 function show(name) {
   for (const s of document.querySelectorAll('[data-screen]')) s.hidden = s.id !== 'screen-' + name;
   const heading = document.querySelector(`#screen-${name} h1, #screen-${name} h2`);
   if (heading) heading.focus({ preventScroll: true });
   window.scrollTo(0, 0);
+  if (name === 'idle') maybeReload();
 }
 
 function describeError(e) {
@@ -815,7 +832,6 @@ el.errCopy.addEventListener('click', async () => flash(el.errCopy, (await copyTe
 // ---------------------------------------------------------------- thread link
 
 // A setup link is only a request to connect: anyone can make one, so nothing is saved until the user agrees.
-let pendingHook = null;
 
 function refreshHookStatus() {
   const saved = loadHook();
@@ -834,10 +850,12 @@ el.hookConnect.addEventListener('click', () => {
   if (pendingHook) saveHook(pendingHook);
   pendingHook = null;
   refreshHookStatus();
+  maybeReload();
 });
 el.hookIgnore.addEventListener('click', () => {
   pendingHook = null;
   refreshHookStatus();
+  maybeReload();
 });
 el.hookForget.addEventListener('click', () => {
   forgetHook();
@@ -857,7 +875,16 @@ async function boot() {
   const ios = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   if (ios && !/Safari\//.test(ua)) el.inAppBanner.hidden = false;
 
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator) {
+    // When an update takes over, reload once (when nothing is in progress) so everyone runs the new version.
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return; // first install: nothing stale to replace
+      reloadWhenIdle = true;
+      maybeReload();
+    });
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
+  }
 
   let problem = null;
   if (!window.isSecureContext) problem = 'insecure';

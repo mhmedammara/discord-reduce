@@ -240,6 +240,22 @@ await test('already-small clip is offered as is', async () => {
   await ctx.close();
 });
 
+await test('a second video works after the first one finished', async () => {
+  const { ctx, page, errors } = await newPage();
+  await page.setInputFiles('#file', fx.noaudio);
+  await visible(page, 'done');
+  await page.click('#againBtn');
+  await visible(page, 'idle');
+  assert.equal(await page.locator('#results video').count(), 0, 'old previews released');
+  await page.setInputFiles('#file', fx.landscape);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item').count(), 1);
+  const out = await save(page, 'out-second.mp4');
+  checkShrunk(out, { limitMB: 10, duration: 25, audio: true });
+  assert.deepEqual(errors, []);
+  await ctx.close();
+});
+
 await test('picking the same file again after finishing works', async () => {
   const { ctx, page } = await newPage();
   await page.setInputFiles('#file', fx.small);
