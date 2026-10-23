@@ -566,6 +566,51 @@ await test('phone check page reports support and runs a real encode', async () =
 });
 
 
+await test('a list of videos is processed one after another; a bad one does not stop the rest', async () => {
+  const { ctx, page, errors } = await newPage();
+  const bad = path.join(work, 'notes.txt');
+  fs.writeFileSync(bad, 'hello');
+  await page.setInputFiles('#file', [fx.landscape, bad, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item').count(), 3);
+  assert.equal(await page.locator('#results .item video').count(), 2, 'two shrunk videos');
+  assert.match(await page.textContent('#results .status.err'), /read|No video/i);
+  const details = await page.textContent('#results details pre');
+  assert.match(details, /Version .*\n.*\nFile: notes.txt/);
+  const files = await saveAll(page, 2, 'out-list');
+  checkShrunk(files.find((f) => /landscape/.test(f.name)).out, { limitMB: 10, duration: 25, audio: true });
+  checkShrunk(files.find((f) => /noaudio/.test(f.name)).out, { limitMB: 10, duration: 20, audio: false });
+  await ctx.close();
+});
+
+await test('a video that cannot be read at first is retried and still made', async () => {
+  // The second file is unreadable for its first 3 seconds, like a phone file that is not ready yet.
+  const { ctx, page } = await newPage({
+    init: () => {
+      const slice = Blob.prototype.slice;
+      let since = 0;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (this.name === 'noaudio.webm') {
+          since ||= Date.now();
+          if (Date.now() - since < 3000) {
+            const broken = () => Promise.reject(new DOMException('not ready', 'NotReadableError'));
+            part.arrayBuffer = broken;
+            part.stream = () => new ReadableStream({ start: (c) => c.error(new DOMException('not ready', 'NotReadableError')) });
+            part.text = broken;
+          }
+        }
+        return part;
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 2, 'both videos made');
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  await ctx.close();
+});
+
 await browser.close();
 server.close();
 const failed = results.filter((r) => !r[1]);

@@ -259,6 +259,32 @@ document.addEventListener('drop', (e) => {
   if (files.length && !$('screen-idle').hidden) onFiles(files);
 });
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Free the file reader of a finished video (its details stay available). */
+function releaseJob(job) {
+  try {
+    if (job.info) job.info.input.dispose();
+  } catch {}
+}
+
+/** One video, with a second try after a pause if it failed for a reason that is not the video's fault. */
+async function runJob(i) {
+  const job = jobs[i];
+  try {
+    await processJob(job, i, jobs.length);
+  } catch (e) {
+    if (e instanceof Cancelled || (e instanceof FriendlyError && ['novideo', 'codec', 'cantEncode'].includes(e.code))) throw e;
+    console.warn('Video failed, trying once more', e);
+    releaseJob(job);
+    job.outputs = [];
+    setWorking('Trying that video again…', 'One moment.', jobs.length > 1 ? `Video ${i + 1} of ${jobs.length}` : '');
+    await sleep(2500);
+    if (cancelled) throw new Cancelled();
+    await processJob(job, i, jobs.length);
+  }
+}
+
 async function onFiles(files) {
   if (busy || !files.length) return;
   busy = true;
@@ -271,11 +297,18 @@ async function onFiles(files) {
   try {
     for (let i = 0; i < jobs.length; i++) {
       try {
-        await processJob(jobs[i], i, jobs.length);
+        await runJob(i);
       } catch (e) {
         if (e instanceof Cancelled) throw e;
         console.error(e);
         jobs[i].error = e;
+      }
+      releaseJob(jobs[i]);
+      if (i < jobs.length - 1) {
+        // Give the phone a moment to free what this video used before the next one starts.
+        setWorking('Getting ready for the next video…', 'One moment.', `Video ${i + 2} of ${jobs.length}`);
+        await sleep(1500);
+        if (cancelled) throw new Cancelled();
       }
     }
     if (jobs.every((j) => j.error)) throw jobs[0].error;
@@ -659,7 +692,20 @@ function finishAll() {
     why.className = 'small status err';
     const code = job.error instanceof FriendlyError && MESSAGES[job.error.code] ? job.error.code : 'generic';
     why.textContent = `${MESSAGES[code][0]}. ${MESSAGES[code][1]}`;
-    card.append(name, why);
+    const details = document.createElement('details');
+    details.open = true;
+    const summary = document.createElement('summary');
+    summary.textContent = 'Technical details';
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:12px;margin:8px 0';
+    pre.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\nFile: ${job.file.name} (${B.formatBytes(job.file.size)}, type "${job.file.type}")\n\n${describeError(job.error)}`;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn';
+    copy.textContent = 'Copy details';
+    copy.addEventListener('click', async () => flash(copy, (await copyText(pre.textContent)) ? 'Copied ✓' : "Couldn't copy"));
+    details.append(summary, pre, copy);
+    card.append(name, why, details);
     el.results.append(card);
   }
 
