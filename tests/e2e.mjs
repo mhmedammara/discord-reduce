@@ -111,6 +111,7 @@ async function newPage(opts = {}) {
   page.on('console', (m) => m.type() === 'error' && errors.push('console: ' + m.text()));
   if (opts.init) await page.addInitScript(opts.init);
   await page.goto(url);
+  if (!opts.unsupported) await page.selectOption('#limit', '10'); // most tests are written for the 10 MB budget
   return { ctx, page, errors };
 }
 
@@ -301,7 +302,7 @@ await test('non-video file gives a friendly error', async () => {
 });
 
 await test('browser without WebCodecs sees the unsupported screen', async () => {
-  const { ctx, page } = await newPage({ init: () => { delete window.VideoEncoder; } });
+  const { ctx, page } = await newPage({ unsupported: true, init: () => { delete window.VideoEncoder; } });
   await visible(page, 'unsupported', 20000);
   await shot(page, '7-unsupported');
   assert.match(await page.textContent('#unsupportedMsg'), /Safari|Chrome/);

@@ -9,7 +9,7 @@ A web page that makes any video small enough to send on Discord without Nitro. B
 
 Everything happens **on your own device**. The video is never uploaded anywhere, and there is nothing to install.
 
-Default limit is **10 MB** (free Discord). A dropdown offers 50 MB and 100 MB for accounts or servers that allow more. Very long videos get blurry at 10 MB, so the page offers to trim them first.
+Default limit is **20 MB** (Discord's free limit since August 2026, per news reports; Discord's own help page wasn't reachable when this was written, so double-check it). A dropdown offers 10 MB in case 20 MB is rejected for you, and 50 MB for Nitro Basic. Very long videos get blurry at 10 MB, so the page offers to trim them first. Discord now measures the size of the file before the phone app compresses it, so an original that looks small enough can still be rejected.
 
 ## Put it online (one time)
 

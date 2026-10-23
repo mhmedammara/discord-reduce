@@ -121,7 +121,7 @@ function showError(e) {
 // ---------------------------------------------------------------- settings
 
 function getLimit() {
-  return Number(el.limit.value) || 10;
+  return Number(el.limit.value) || 20;
 }
 
 try {
