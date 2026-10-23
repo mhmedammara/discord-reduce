@@ -642,6 +642,85 @@ await test('later videos still work when the phone stops letting the page read t
   await ctx.close();
 });
 
+await test('videos the phone will not share are skipped, then chosen again with one tap', async () => {
+  // Like the user's phone: only the first file of a pick can be read. (Real error text from Android Chrome.)
+  const { ctx, page } = await newPage({
+    init: () => {
+      const t0 = Date.now();
+      document.addEventListener('change', (e) => { if (e.target.id === 'file') window.__first = e.target.files[0]; }, true);
+      const bad = (blob) => blob.name === 'noaudio.webm' && blob.lastModified < t0 - 1000 && blob !== window.__first;
+      const msg = 'The requested file could not be read, typically due to permission problems that have occurred after a reference to a file was acquired.';
+      const fail = () => Promise.reject(new DOMException(msg, 'NotReadableError'));
+      const slice = Blob.prototype.slice;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (bad(this)) {
+          part.arrayBuffer = fail;
+          part.stream = () => new ReadableStream({ start: (c) => c.error(new DOMException(msg, 'NotReadableError')) });
+        }
+        return part;
+      };
+      const ab = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        return bad(this) ? fail() : ab.call(this);
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 1, 'the readable video is made');
+  assert.match(await page.textContent('#results .status.err'), /stopped sharing/);
+  assert.match(await page.textContent('#results details pre'), /Copy at pick time failed: NotReadableError/); // there, but collapsed
+  assert.equal(await page.isVisible('#results details pre'), false);
+  assert.match(await page.textContent('#repickBtn'), /Choose the skipped video again/);
+  await shot(page, '10-skipped');
+
+  const [chooser] = await Promise.all([page.waitForEvent('filechooser', { timeout: 5000 }), page.click('#repickBtn')]);
+  await chooser.setFiles([fx.noaudio]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 2, 'both videos are now made');
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  assert.equal(await page.isVisible('#repickBtn'), false);
+  await ctx.close();
+});
+
+await test('a phone that only lets the page read picked files for 1.5 s still gets every video made', async () => {
+  // Every original turns unreadable 1.5 s after the pick (reads that started in time carry on), like the
+  // user's phone. Only reads started at pick time may use the originals.
+  const { ctx, page } = await newPage({
+    init: () => {
+      let tPick = 0;
+      document.addEventListener('change', (e) => { if (e.target.id === 'file') tPick = Date.now(); }, true);
+      const t0 = Date.now();
+      const bad = (blob) => tPick && blob.lastModified < t0 - 1000 && Date.now() - tPick > 1500;
+      const err = () => new DOMException('The requested file could not be read, typically due to permission problems that have occurred after a reference to a file was acquired.', 'NotReadableError');
+      const slice = Blob.prototype.slice;
+      Blob.prototype.slice = function (...a) {
+        const part = slice.apply(this, a);
+        if (bad(this)) {
+          part.arrayBuffer = () => Promise.reject(err());
+          part.stream = () => new ReadableStream({ start: (c) => c.error(err()) });
+        }
+        return part;
+      };
+      const ab = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        return bad(this) ? Promise.reject(err()) : ab.call(this);
+      };
+    },
+  });
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.noaudio, fx.small]);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 4, 'all four videos made');
+  assert.equal(await page.locator('#results .status.err').count(), 0);
+  assert.equal(await page.isVisible('#repickBtn'), false);
+  // the files can really be used afterwards (saving reads them), including the one that needed no shrinking
+  const files = await saveAll(page, 4, 'out-expiry');
+  assert.equal(files.length, 4);
+  for (const f of files) assert.ok(fs.statSync(f.out).size > 10_000, f.name + ' is not empty');
+  await ctx.close();
+});
+
 await browser.close();
 server.close();
 const failed = results.filter((r) => !r[1]);

@@ -20,7 +20,7 @@ const el = Object.fromEntries(
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
-    'doneTitle', 'doneSizes', 'results', 'doneNote',
+    'doneTitle', 'doneSizes', 'results', 'doneNote', 'repickBtn',
     'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
     'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
   ].map((id) => [id, $(id)]),
@@ -35,8 +35,15 @@ const MESSAGES = {
   ],
   cantEncode: ["This browser can't shrink videos", 'On iPhone use Safari (iOS 16.4 or newer). On Android use Chrome.'],
   toobig: ["Couldn't get it small enough", 'Even after squeezing, this video is still over the limit. Try a shorter clip.'],
+  repick: ["Your phone stopped sharing this video with the page", 'Choose it again with the button below.'],
   generic: ['Something went wrong', 'Try again. If it keeps happening, try a shorter clip or close other apps to free up memory.'],
 };
+
+/** The phone refused to let the page read a picked file (typical for the later videos of a multi-pick). */
+function isUnreadable(e) {
+  const c = (e && e.cause) || e;
+  return !!c && (c.name === 'NotReadableError' || /could not be read|permission problems|network error/i.test(String(c.message || c)));
+}
 
 class FriendlyError extends Error {
   constructor(code, cause) {
@@ -68,6 +75,7 @@ let jobs = []; // one per picked file: { file, info, outputs: [], error }
 let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
+let repick = null; // finished videos kept while the user chooses the skipped ones again
 let wakeLock = null;
 let pendingDecision = null; // { resolve, reject } while the trim screen is open
 let trimJob = null;
@@ -93,6 +101,7 @@ function resetAll(keepInput = false) {
   jobs = [];
   pendingDecision = null;
   trimJob = null;
+  if (!keepInput) repick = null;
   if (!keepInput) el.file.value = ''; // clearing it early can release the picked file on some phones
 }
 
@@ -259,22 +268,31 @@ document.addEventListener('drop', (e) => {
   if (files.length && !$('screen-idle').hidden) onFiles(files);
 });
 
-// Phones can stop letting the page read the other picked videos once the first one has been busy for a while
-// (they then failed with "TypeError: network error"). Copy them into memory now, while they can still be read.
+// Phones only let the page read a picked file for a short while after it was picked (later videos of a list
+// failed with "The requested file could not be read ... permission problems"). So when several videos are
+// picked, reading ALL of them starts at once, in the same instant as the pick, and the copies are kept in memory.
 const COPY_FILE_MAX = 400e6;
 const COPY_TOTAL_MAX = 900e6;
-async function snapshotLaterFiles() {
+function startCopies(files) {
   let room = COPY_TOTAL_MAX;
-  for (let i = 1; i < jobs.length; i++) {
-    const f = jobs[i].file;
-    if (f.size > COPY_FILE_MAX || f.size > room) continue; // too big to hold: read it from the phone as usual
-    setWorking('Getting your videos ready…', `Video ${i + 1} of ${jobs.length}`, '');
-    try {
-      jobs[i].source = new File([await f.arrayBuffer()], f.name, { type: f.type });
-      room -= f.size;
-    } catch (e) {
-      console.warn('Could not copy ' + f.name + ' ahead of time', e);
-    }
+  return files.map((f) => {
+    if (f.size > COPY_FILE_MAX || f.size > room) return null; // too big to hold: it is read from the phone as usual
+    room -= f.size;
+    return f.arrayBuffer().then(
+      (buf) => new File([buf], f.name, { type: f.type }),
+      (error) => ({ error }),
+    );
+  });
+}
+
+async function attachCopies(copies, offset) {
+  setWorking('Getting your videos ready…', 'One moment.', '');
+  for (let i = 0; i < copies.length; i++) {
+    const r = copies[i] && (await copies[i]);
+    if (!r) continue;
+    const job = jobs[offset + i];
+    if (r instanceof File) job.source = r;
+    else job.diag = `Copy at pick time failed: ${r.error && r.error.name}: ${r.error && r.error.message}`;
   }
 }
 
@@ -305,22 +323,31 @@ async function runJob(i) {
     setWorking('Trying that video again…', 'One moment.', jobs.length > 1 ? `Video ${i + 1} of ${jobs.length}` : '');
     await sleep(2500);
     if (cancelled) throw new Cancelled();
-    await processJob(job, i, jobs.length);
+    try {
+      await processJob(job, i, jobs.length);
+    } catch (e2) {
+      // Still refused after a pause: only choosing the video again will give the page access to it.
+      if (isUnreadable(e2)) throw new FriendlyError('repick', e2 instanceof FriendlyError ? e2.cause || e2 : e2);
+      throw e2;
+    }
   }
 }
 
 async function onFiles(files) {
   if (busy || !files.length) return;
+  const copies = files.length > 1 ? startCopies(files) : []; // first thing: the phone's permission is short-lived
   busy = true;
   cancelled = false;
+  const kept = repick || [];
+  repick = null;
   resetAll(true);
-  jobs = files.map((file) => ({ file, info: null, outputs: [], error: null }));
+  jobs = [...kept, ...files.map((file) => ({ file, info: null, outputs: [], error: null }))];
   keepAwake();
   setWorking('Reading your video…', 'This only takes a moment.', '');
   show('work');
   try {
-    await snapshotLaterFiles();
-    for (let i = 0; i < jobs.length; i++) {
+    await attachCopies(copies, kept.length);
+    for (let i = kept.length; i < jobs.length; i++) {
       try {
         await runJob(i);
       } catch (e) {
@@ -360,7 +387,7 @@ async function processJob(job, index, total) {
   const info = job.info;
 
   if (B.fitsAlready(job.file.size, limitMB()) && !el.trimFirst.checked) {
-    job.outputs = [{ file: job.file, original: true, bytes: job.file.size, durationText: B.formatDuration(info.duration), plan: null, part: null }];
+    job.outputs = [{ file: job.source || job.file, original: true, bytes: job.file.size, durationText: B.formatDuration(info.duration), plan: null, part: null }];
     return;
   }
 
@@ -718,12 +745,12 @@ function finishAll() {
     const code = job.error instanceof FriendlyError && MESSAGES[job.error.code] ? job.error.code : 'generic';
     why.textContent = `${MESSAGES[code][0]}. ${MESSAGES[code][1]}`;
     const details = document.createElement('details');
-    details.open = true;
+    details.open = !(job.error instanceof FriendlyError && job.error.code === 'repick'); // keep the button in view
     const summary = document.createElement('summary');
     summary.textContent = 'Technical details';
     const pre = document.createElement('pre');
     pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:12px;margin:8px 0';
-    pre.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\nFile: ${job.file.name} (${B.formatBytes(job.file.size)}, type "${job.file.type}")\n\n${describeError(job.error)}`;
+    pre.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\nFile: ${job.file.name} (${B.formatBytes(job.file.size)}, type "${job.file.type}")\n${job.diag || ''}\n\n${describeError(job.error)}`;
     const copy = document.createElement('button');
     copy.type = 'button';
     copy.className = 'btn';
@@ -733,6 +760,10 @@ function finishAll() {
     card.append(name, why, details);
     el.results.append(card);
   }
+
+  const skipped = failed.filter((j) => j.error instanceof FriendlyError && j.error.code === 'repick');
+  el.repickBtn.hidden = !skipped.length;
+  el.repickBtn.textContent = skipped.length === 1 ? 'Choose the skipped video again' : `Choose the ${skipped.length} skipped videos again`;
 
   const before = ok.reduce((n, j) => n + j.file.size, 0);
   const after = outputs.reduce((n, o) => n + o.out.bytes, 0);
@@ -843,6 +874,12 @@ el.saveBtn.addEventListener('click', async () => {
     a.remove();
     await new Promise((r) => setTimeout(r, 400));
   }
+});
+
+el.repickBtn.addEventListener('click', () => {
+  repick = jobs.filter((j) => !j.error); // keep what is done; the new pick is added to it
+  el.file.value = '';
+  el.file.click();
 });
 
 el.againBtn.addEventListener('click', () => {
