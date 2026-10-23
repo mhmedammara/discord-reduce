@@ -79,7 +79,7 @@ function objectUrl(blob) {
   return u;
 }
 
-function resetAll() {
+function resetAll(keepInput = false) {
   for (const u of urls) URL.revokeObjectURL(u);
   urls.clear();
   el.trimVideo.removeAttribute('src');
@@ -93,7 +93,7 @@ function resetAll() {
   jobs = [];
   pendingDecision = null;
   trimJob = null;
-  el.file.value = '';
+  if (!keepInput) el.file.value = ''; // clearing it early can release the picked file on some phones
 }
 
 const limitMB = () => Number(el.limit.value) || 20;
@@ -120,6 +120,7 @@ function showError(e) {
   el.errTitle.textContent = title;
   el.errMsg.textContent = msg;
   el.errDetail.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\n\n${describeError(e)}`;
+  document.getElementById('errDetails').open = true;
   show('error');
 }
 
@@ -160,42 +161,63 @@ el.limit.addEventListener('change', () => store.set('dr-limit', el.limit.value))
 
 // ---------------------------------------------------------------- analysis
 
+/** Phones hand over files lazily; touching the start first avoids a failed first read. */
+async function warmUp(file) {
+  try {
+    await file.slice(0, 4096).arrayBuffer();
+  } catch {}
+}
+
 async function analyze(file) {
+  await warmUp(file);
+  try {
+    return await analyzeOnce(file);
+  } catch (e) {
+    if (e instanceof FriendlyError && e.code !== 'unreadable') throw e;
+    // One more try: a lazily exported file is often readable a moment later.
+    await new Promise((r) => setTimeout(r, 700));
+    await warmUp(file);
+    return analyzeOnce(file);
+  }
+}
+
+async function analyzeOnce(file) {
   const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
   try {
-    const [video, audioTrack] = await Promise.all([input.getPrimaryVideoTrack(), input.getPrimaryAudioTrack()]);
+    const video = await input.getPrimaryVideoTrack();
     if (!video) throw new FriendlyError('novideo');
     if (!(await video.canDecode())) throw new FriendlyError('codec');
 
     const [width, height, duration, stats, hdr] = await Promise.all([
       video.getDisplayWidth(),
       video.getDisplayHeight(),
-      input.computeDuration(),
-      video.computePacketStats(150),
+      input.computeDuration().catch(() => video.getDurationFromMetadata()),
+      video.computePacketStats(150).catch(() => ({ averagePacketRate: 30 })),
       video.hasHighDynamicRange().catch(() => false),
     ]);
+    if (!(duration > 0)) throw new Error('Could not work out how long the video is');
 
+    // Trouble reading the sound must not sink the whole video: carry on without it.
     let audio = null;
-    if (audioTrack) {
-      const [codec, channels, decodable] = await Promise.all([
-        audioTrack.getCodec(),
-        audioTrack.getNumberOfChannels(),
-        audioTrack.canDecode(),
-      ]);
-      let bitrate = await audioTrack.getAverageBitrate();
-      if (!bitrate) bitrate = (await audioTrack.computePacketStats(150)).averageBitrate;
-      audio = { codec, channels, bitrate, decodable };
+    let audioLost = false;
+    try {
+      const audioTrack = await input.getPrimaryAudioTrack();
+      if (audioTrack) {
+        const [codec, channels, decodable] = await Promise.all([
+          audioTrack.getCodec(),
+          audioTrack.getNumberOfChannels(),
+          audioTrack.canDecode(),
+        ]);
+        let bitrate = await audioTrack.getAverageBitrate();
+        if (!bitrate) bitrate = (await audioTrack.computePacketStats(150)).averageBitrate;
+        audio = { codec, channels, bitrate, decodable };
+      }
+    } catch (e) {
+      console.warn('Could not read the sound track', e);
+      audio = null;
+      audioLost = true;
     }
-    return {
-      input,
-      file,
-      width,
-      height,
-      duration,
-      fps: stats.averagePacketRate,
-      audio,
-      hdr,
-    };
+    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio, audioLost, hdr };
   } catch (e) {
     input.dispose();
     throw e instanceof FriendlyError ? e : new FriendlyError('unreadable', e);
@@ -241,7 +263,7 @@ async function onFiles(files) {
   if (busy || !files.length) return;
   busy = true;
   cancelled = false;
-  resetAll();
+  resetAll(true);
   jobs = files.map((file) => ({ file, info: null, outputs: [], error: null }));
   keepAwake();
   setWorking('Reading your video…', 'This only takes a moment.', '');
@@ -468,7 +490,7 @@ async function encodeOnce(info, plan, trim, onProgress, probe = false) {
   if (!videoCodec) throw new FriendlyError('cantEncode');
 
   let audio; // undefined = let the converter copy the sound untouched
-  if (probe || (info.audio && !plan.audio)) {
+  if (probe || info.audioLost || (info.audio && !plan.audio)) {
     audio = { discard: true };
   } else if (plan.audio && !plan.audio.copy) {
     await ensureAacEncoder();
@@ -564,7 +586,7 @@ async function encodeSegment(job, seg, part, queue) {
         part,
         durationText: B.formatDuration(length),
         note: [
-          plan.audioDropped ? "The sound couldn't be kept for this video." : '',
+          plan.audioDropped || info.audioLost ? "The sound couldn't be kept for this video." : '',
           info.hdr ? 'This was an HDR video, so colors may look a little different.' : '',
           out.videoCodec !== 'avc' ? "This browser can't make the most compatible video type, so some devices may not preview it." : '',
         ]

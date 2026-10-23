@@ -240,6 +240,18 @@ await test('already-small clip is offered as is', async () => {
   await ctx.close();
 });
 
+await test('picking the same file again after finishing works', async () => {
+  const { ctx, page } = await newPage();
+  await page.setInputFiles('#file', fx.small);
+  await visible(page, 'done');
+  await page.click('#againBtn');
+  await visible(page, 'idle');
+  await page.setInputFiles('#file', fx.small);
+  await visible(page, 'done');
+  assert.match(await page.textContent('#doneTitle'), /Already small enough/);
+  await ctx.close();
+});
+
 await test('50 MB limit uses the bigger budget', async () => {
   const { ctx, page } = await newPage();
   await page.selectOption('#limit', '50');
