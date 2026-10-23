@@ -4,7 +4,7 @@ import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 // Must match version.js; bumped together on every release.
-const APP_VERSION = '1.1.21';
+const APP_VERSION = '1.1.22';
 const B = window.DRBudget;
 const { Input, ALL_FORMATS, BlobSource, BufferSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
@@ -297,12 +297,26 @@ function probeShareCapacity() {
   }
 }
 
+function shareCapacityText() {
+  const mb = (b) => (Number.isFinite(b) ? `${Math.round(b / 1e6)} MB` : 'no size limit');
+  const learned = learnedShareLimit();
+  return (
+    (shareCapacity ? `One share carries (browser says): ${shareCapacity.files} files, ${mb(shareCapacity.bytes)}.` : 'No share sheet.') +
+    (learned ? ` Phone refused more than: ${learned.files} files, ${mb(learned.bytes)}.` : '')
+  );
+}
+
 /** How many videos may be picked at once so that all of them go out in one share at full quality. */
 function pickLimit() {
-  if (!shareCapacity || loadHook()) return Infinity; // posting to a thread has no such limit
+  if (loadHook()) return Infinity; // posting to a thread has no such limit
   const perVideo = chosenLimitMB() * 1e6 * 0.99; // the most a finished video can weigh
-  const bySize = Number.isFinite(shareCapacity.bytes) ? Math.floor(shareCapacity.bytes / perVideo) : Infinity;
-  return Math.max(1, Math.min(shareCapacity.files, bySize));
+  let max = Infinity;
+  for (const cap of [shareCapacity, learnedShareLimit()]) {
+    if (!cap) continue;
+    const bySize = Number.isFinite(cap.bytes) ? Math.floor(cap.bytes / perVideo) : Infinity;
+    max = Math.min(max, cap.files, bySize);
+  }
+  return Number.isFinite(max) ? Math.max(1, max) : Infinity;
 }
 
 function refreshPickHint() {
@@ -842,7 +856,7 @@ function finishAll() {
     summary.textContent = 'Technical details';
     const pre = document.createElement('pre');
     pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;font-size:12px;margin:8px 0';
-    pre.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\nFile: ${job.file.name} (${B.formatBytes(job.file.size)}, type "${job.file.type}")\n${job.diag || ''}\n\n${describeError(job.error)}`;
+    pre.textContent = `Version ${window.DR_VERSION}\n${navigator.userAgent}\nFile: ${job.file.name} (${B.formatBytes(job.file.size)}, type "${job.file.type}")\n${job.diag || ''}\n${shareCapacityText()}\n\n${describeError(job.error)}`;
     const copy = document.createElement('button');
     copy.type = 'button';
     copy.className = 'btn';
@@ -948,19 +962,34 @@ el.postBtn.addEventListener('click', async () => {
   }
 });
 
-// A browser only lets one share carry a limited number of files and megabytes, so a long list goes out in
-// batches: one tap per batch. A batch is made as large as the browser accepts.
-const SHARE_MAX_FILES = 8;
-const SHARE_MAX_BYTES = 40e6;
+// One tap sends everything the browser accepts. (Earlier versions cut the list into batches by their own fixed
+// 8-file / 40 MB rule, which is why sharing went 2 by 2.) If a phone refuses a share that the browser said it
+// would accept, that size is remembered, and the next pick is capped to what really fits (see pickLimit).
 let shareNext = 0; // index of the first video not yet sent
+
+function learnedShareLimit() {
+  try {
+    const v = JSON.parse(store.get('dr-share-limit'));
+    return v && v.files > 0 && v.bytes > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function learnShareLimit(files, bytes) {
+  const prev = learnedShareLimit();
+  const next = prev ? { files: Math.min(prev.files, files), bytes: Math.min(prev.bytes, bytes) } : { files, bytes };
+  store.set('dr-share-limit', JSON.stringify(next));
+}
 
 function nextShareBatch() {
   const items = flat();
+  const limit = learnedShareLimit();
   const batch = [];
   let bytes = 0;
-  for (let i = shareNext; i < items.length && batch.length < SHARE_MAX_FILES; i++) {
+  for (let i = shareNext; i < items.length; i++) {
     const size = items[i].out.file.size;
-    if (batch.length && bytes + size > SHARE_MAX_BYTES) break;
+    if (limit && batch.length && (batch.length >= limit.files || bytes + size > limit.bytes)) break;
     batch.push(fileOf(items[i].out));
     bytes += size;
   }
@@ -1010,6 +1039,17 @@ el.shareBtn.addEventListener('click', async () => {
       shareNext >= total ? `All ${total} sent.` : `Sent ${shareNext} of ${total}. Tap the button again to send the next ones.`;
   } catch (e) {
     if (e && e.name === 'AbortError') return;
+    if (batch.length > 1) {
+      // The phone refused this many at once: remember it, offer a smaller group now, and cap the next pick.
+      learnShareLimit(batch.length - 1, batch.reduce((n, f) => n + f.size, 0) - 1);
+      updateShareButton();
+      refreshPickHint();
+      el.shareStatus.hidden = false;
+      el.shareStatus.textContent =
+        `Your phone refused ${batch.length} videos in one share. Tap the button again to send them in smaller groups. ` +
+        'From now on the page only takes as many videos as fit in one share.';
+      return;
+    }
     el.doneNote.hidden = false;
     el.doneNote.textContent = "Sharing didn't work. Tap Save to my device, then attach the videos in Discord.";
   }

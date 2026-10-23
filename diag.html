@@ -114,6 +114,18 @@
       const f = new File([new Uint8Array(4)], 'a.mp4', { type: 'video/mp4' });
       return `share ${yn(!!navigator.share)}, canShare(files) ${yn(!!(navigator.canShare && navigator.canShare({ files: [f] })))}`;
     });
+    await check('One share carries (browser says)', () => {
+      if (!navigator.canShare) return 'no share sheet';
+      const block = new Blob([new Uint8Array(1 << 20)]);
+      const fileOf = (mb, name = 'probe.mp4') => new File(Array(mb).fill(block), name, { type: 'video/mp4' });
+      const ok = (files) => navigator.canShare({ files });
+      let files = 1;
+      while (files < 12 && ok(Array.from({ length: files + 1 }, (_, i) => fileOf(1, `p${i}.mp4`)))) files++;
+      let mb = 1;
+      for (let m = 8; m <= 512 && ok([fileOf(m)]); m *= 2) mb = m;
+      return `${files} files, ${mb >= 512 ? 'at least 512' : 'about ' + mb} MB`;
+    });
+    await check('Phone refused before', () => localStorage.getItem('dr-share-limit') || 'never');
     add('Screen wake lock', yn('wakeLock' in navigator));
     add('Clipboard', yn(!!(navigator.clipboard && navigator.clipboard.writeText)));
     await check('Saved settings work', () => { localStorage.setItem('dr-diag', '1'); localStorage.removeItem('dr-diag'); return 'yes'; });
