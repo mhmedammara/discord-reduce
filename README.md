@@ -10,8 +10,8 @@ A web page that makes videos small enough to send on Discord without Nitro. Buil
 Everything is shrunk **on your own device**. Nothing is uploaded unless you tap Post or Send, and there is nothing to install.
 
 - **Size limit:** default **20 MB** (Discord's free limit since August 2026, per news reports; Discord's own help page wasn't reachable when this was written, so double-check it). The dropdown also offers 10 MB, in case 20 MB is rejected for you, and 50 MB for Nitro Basic.
-- **Long videos:** if a clip would come out soft, the page offers to trim it or **split it into sharp parts**.
-- **Concert mode** (on by default) keeps the sound at 128 kbps where the size allows.
+- **Long videos:** if a clip would come out soft, the page offers to **split it into sharp parts** (the default button) or keep it as one softer video, and you can trim first.
+- **Concert sound:** the sound keeps 128 kbps where the size allows.
 - **Privacy:** location and device info in the original are *not* copied into the shrunk file.
 - **Works offline** once opened one time.
 

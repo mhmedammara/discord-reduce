@@ -16,7 +16,7 @@ const SOFT_BELOW = 480; // asking about trim/split when the picture would drop b
 const $ = (id) => document.getElementById(id);
 const el = Object.fromEntries(
   [
-    'file', 'limit', 'concert', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
+    'file', 'limit', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
@@ -97,7 +97,7 @@ function resetAll() {
 }
 
 const limitMB = () => Number(el.limit.value) || 20;
-const concert = () => el.concert.checked;
+const concert = () => true; // these are concert videos: the sound always gets the bigger share
 
 // ---------------------------------------------------------------- screens
 
@@ -155,10 +155,8 @@ async function flash(button, text) {
 try {
   const saved = store.get('dr-limit');
   if (saved && [...el.limit.options].some((o) => o.value === saved)) el.limit.value = saved;
-  if (store.get('dr-concert') === '0') el.concert.checked = false;
 } catch {}
 el.limit.addEventListener('change', () => store.set('dr-limit', el.limit.value));
-el.concert.addEventListener('change', () => store.set('dr-concert', el.concert.checked ? '1' : '0'));
 
 // ---------------------------------------------------------------- analysis
 
@@ -349,7 +347,11 @@ function updateTrim(changed) {
   el.trimSummary.textContent = text;
   el.trimSplit.hidden = parts.length < 2;
   el.trimSplit.textContent = `Split into ${parts.length} parts`;
-  el.trimGo.textContent = soft && parts.length > 1 ? 'Shrink it as one video' : 'Shrink it';
+  // When splitting is on offer it is the default (sharper); keeping one video is the quieter choice.
+  const splitFirst = parts.length > 1;
+  el.trimSplit.classList.toggle('primary', splitFirst);
+  el.trimGo.classList.toggle('primary', !splitFirst);
+  el.trimGo.textContent = splitFirst ? 'Keep it as one video (less sharp)' : 'Shrink it';
 }
 
 function askTrim(job, reason, queue) {

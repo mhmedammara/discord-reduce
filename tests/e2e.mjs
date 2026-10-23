@@ -276,6 +276,9 @@ await test('very long clip asks to trim, then works', async () => {
   await shot(page, '5-trim-long');
   assert.match(await page.textContent('#trimInfo'), /soft/);
   assert.equal(await page.isVisible('#trimSplit'), true, 'split offered');
+  assert.match(await page.getAttribute('#trimSplit', 'class'), /primary/, 'split is the default button');
+  assert.doesNotMatch(await page.getAttribute('#trimGo', 'class'), /primary/);
+  assert.equal(await page.isVisible('#concert'), false, 'no concert checkbox');
   await page.$eval('#trimEnd', (el) => { el.value = '60'; el.dispatchEvent(new Event('input')); });
   await page.click('#trimGo');
   await visible(page, 'done');
