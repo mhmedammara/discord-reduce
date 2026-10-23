@@ -758,6 +758,45 @@ await test('a long list is shared in batches the browser accepts', async () => {
   await ctx.close();
 });
 
+await test('a list is sized at pick time so everything goes out in one share', async () => {
+  // A browser that accepts at most 3 files and 24 MB per share.
+  const { ctx, page } = await newPage({
+    init: () => {
+      window.__shares = [];
+      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 24 * 1048576;
+      navigator.canShare = (d) => !!d && !!d.files && ok(d);
+      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
+    },
+  });
+  await page.selectOption('#limit', '20');
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
+  await visible(page, 'done');
+  assert.match(await page.textContent('#doneNote'), /Each video was sized to 7\.\d MB so all 3 can go out in one share/);
+  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet', 'one share, not batches');
+  await page.click('#shareBtn');
+  const shares = await page.evaluate(() => window.__shares);
+  assert.equal(shares.length, 1);
+  assert.equal(shares[0].length, 3);
+  const files = await saveAll(page, 3, 'out-oneshare');
+  for (const f of files) assert.ok(fs.statSync(f.out).size <= 24 * 1048576 / 3, `${f.name} ${fs.statSync(f.out).size}`);
+  await ctx.close();
+});
+
+await test('one video keeps the full size even on a phone with a share limit', async () => {
+  const { ctx, page } = await newPage({
+    init: () => {
+      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 24 * 1048576;
+      navigator.canShare = (d) => !!d && !!d.files && ok(d);
+      navigator.share = async () => {};
+    },
+  });
+  await page.selectOption('#limit', '20');
+  await page.setInputFiles('#file', [fx.landscape]);
+  await visible(page, 'done');
+  assert.ok(!/Each video was sized/.test(await page.textContent('#doneNote')));
+  await ctx.close();
+});
+
 await browser.close();
 server.close();
 const failed = results.filter((r) => !r[1]);

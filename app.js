@@ -101,11 +101,17 @@ function resetAll(keepInput = false) {
   jobs = [];
   pendingDecision = null;
   trimJob = null;
-  if (!keepInput) repick = null;
+  if (!keepInput) {
+    repick = null;
+    batchLimitMB = null;
+  }
   if (!keepInput) el.file.value = ''; // clearing it early can release the picked file on some phones
 }
 
-const limitMB = () => Number(el.limit.value) || 20;
+const chosenLimitMB = () => Number(el.limit.value) || 20;
+// While a list is being made, every video gets a size small enough for the whole list to go out in ONE share.
+let batchLimitMB = null;
+const limitMB = () => (batchLimitMB ? Math.min(batchLimitMB, chosenLimitMB()) : chosenLimitMB());
 const concert = () => true; // these are concert videos: the sound always gets the bigger share
 
 // ---------------------------------------------------------------- screens
@@ -247,6 +253,47 @@ function makePlan(info, duration, noCopy) {
 
 const needsDecision = (plan) => plan.quality === 'low' || Math.min(plan.width, plan.height) < SOFT_BELOW;
 
+// ---------------------------------------------------------------- what one share can carry
+
+// The browser refuses a share that carries too many files or megabytes. Ask it how much it accepts, using
+// stand-in files (many references to one small block, so nothing big is allocated).
+let shareCapacity = null; // { files, bytes } or null when unlimited / unknown
+
+function probeShareCapacity() {
+  try {
+    if (!navigator.share || !navigator.canShare) return null;
+    const type = 'video/mp4';
+    const block = new Blob([new Uint8Array(1 << 20)]); // 1 MiB
+    const fileOf = (mb, name = 'probe.mp4') => new File(Array(mb).fill(block), name, { type });
+    const accepts = (files) => navigator.canShare({ files });
+    if (!accepts([fileOf(1)])) return null;
+
+    // largest number of files
+    let files = 1;
+    while (files < 30 && accepts(Array.from({ length: files + 1 }, (_, i) => fileOf(1, `p${i}.mp4`)))) files++;
+
+    // largest total size (grow, then narrow down)
+    let ok = 1;
+    let bad = 0;
+    for (let mb = 8; mb <= 1024; mb *= 2) {
+      if (accepts([fileOf(mb)])) ok = mb;
+      else {
+        bad = mb;
+        break;
+      }
+    }
+    if (!bad) return { files, bytes: Infinity };
+    while (bad - ok > 1) {
+      const mid = Math.floor((ok + bad) / 2);
+      if (accepts([fileOf(mid)])) ok = mid;
+      else bad = mid;
+    }
+    return { files, bytes: ok * 1048576 };
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- picking files
 
 el.file.addEventListener('change', () => onFiles([...(el.file.files || [])]));
@@ -344,6 +391,13 @@ async function onFiles(files) {
   cancelled = false;
   const kept = repick || [];
   repick = null;
+  // The very first thing decided for a list: how big each video may be so that all of them fit in one share.
+  // (Not needed when posting to a thread: that has no such limit.)
+  batchLimitMB = null;
+  const count = kept.length + files.length;
+  if (count > 1 && shareCapacity && Number.isFinite(shareCapacity.bytes) && !loadHook()) {
+    batchLimitMB = Math.max(2, Math.floor(((shareCapacity.bytes * 0.92) / count / 1e6) * 10) / 10);
+  }
   resetAll(true);
   jobs = [...kept, ...files.map((file) => ({ file, info: null, outputs: [], error: null }))];
   keepAwake();
@@ -790,6 +844,9 @@ function finishAll() {
     el.doneSizes.append(a, arrow, b);
   }
   const notes = [...new Set(outputs.map((o) => o.out.note).filter(Boolean))];
+  if (batchLimitMB && batchLimitMB < chosenLimitMB()) {
+    notes.unshift(`Each video was sized to ${batchLimitMB} MB so all ${outputs.length > jobs.length ? outputs.length : jobs.length} can go out in one share.`);
+  }
   el.doneNote.hidden = !notes.length;
   el.doneNote.textContent = notes.join(' ');
 
@@ -987,6 +1044,7 @@ el.hookForget.addEventListener('click', () => {
 
 async function boot() {
   window.__drBooted = true;
+  shareCapacity = probeShareCapacity();
   el.version.textContent = 'v' + window.DR_VERSION;
   pendingHook = captureHookFromLocation();
   refreshHookStatus();
