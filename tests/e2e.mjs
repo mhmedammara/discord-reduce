@@ -378,6 +378,8 @@ await test('a short test pass runs first, and normal clips need only one full pa
   await visible(page, 'done');
   const titles = await page.evaluate(() => window.__titles);
   assert.ok(titles.includes('Checking your video…'), 'sample pass ran: ' + titles);
+  const speed = await page.textContent('#speedLog');
+  for (const needle of ['Read landscape.webm', 'Sample pass', 'Pass 1:', 'x realtime', 'All done']) assert.ok(speed.includes(needle), `speed log lacks "${needle}":\n${speed}`);
   assert.ok(!(await page.evaluate(() => /Almost there/.test(document.body.textContent))), 'no redo needed');
   assert.equal(await page.locator('#captionCard').count(), 0, 'no message block');
   // without a thread link the page is the plain share/save version

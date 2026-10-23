@@ -20,7 +20,7 @@ const el = Object.fromEntries(
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
-    'doneTitle', 'doneSizes', 'results', 'doneNote',
+    'doneTitle', 'doneSizes', 'results', 'doneNote', 'speedLog', 'speedCopy',
     'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
     'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
   ].map((id) => [id, $(id)]),
@@ -61,6 +61,17 @@ const store = {
     } catch {}
   },
 };
+
+// ---------------------------------------------------------------- speed log
+// A short plain-text record of where the time went, shown (collapsed) on the finished screen so slow
+// cases can be copied and reported.
+
+let perfLines = [];
+let perfStart = 0;
+const secs = (ms) => (ms / 1000).toFixed(1) + ' s';
+function perf(line) {
+  perfLines.push(`[${secs(performance.now() - perfStart)}] ${line}`);
+}
 
 // ---------------------------------------------------------------- state
 
@@ -217,7 +228,8 @@ async function analyzeOnce(file) {
       audio = null;
       audioLost = true;
     }
-    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio, audioLost, hdr };
+    const codec = await video.getCodec().catch(() => '?');
+    return { input, file, width, height, duration, fps: stats.averagePacketRate, audio, audioLost, hdr, codec };
   } catch (e) {
     input.dispose();
     throw e instanceof FriendlyError ? e : new FriendlyError('unreadable', e);
@@ -265,6 +277,9 @@ async function onFiles(files) {
   cancelled = false;
   resetAll(true);
   jobs = files.map((file) => ({ file, info: null, outputs: [], error: null }));
+  perfLines = [];
+  perfStart = performance.now();
+  perf(`Version ${window.DR_VERSION}; ${navigator.userAgent}`);
   keepAwake();
   setWorking('Reading your video…', 'This only takes a moment.', '');
   show('work');
@@ -297,7 +312,9 @@ async function processJob(job, index, total) {
   const queue = total > 1 ? `Video ${index + 1} of ${total}` : '';
   setWorking('Reading your video…', 'This only takes a moment.', queue);
   show('work');
+  const tRead = performance.now();
   job.info = await analyze(job.file);
+  perf(`Read ${job.file.name}: ${secs(performance.now() - tRead)}; ${B.formatBytes(job.file.size)}, ${job.info.codec}, ${job.info.width}x${job.info.height} @${job.info.fps.toFixed(1)} fps, ${B.formatDuration(job.info.duration)}, audio ${job.info.audio ? job.info.audio.codec + ' ' + Math.round((job.info.audio.bitrate || 0) / 1000) + ' kbps' : 'none'}, HDR ${job.info.hdr}`);
   if (cancelled) throw new Cancelled();
   const info = job.info;
 
@@ -558,8 +575,12 @@ async function encodeSegment(job, seg, part, queue) {
     const sample = { start: from, end: from + PROBE_SECONDS };
     const layout = B.layoutFor(videoBps, { width: info.width, height: info.height, fps: info.fps });
     try {
+      const tProbe = performance.now();
       const probed = await encodeOnce(info, { ...plan, videoBitrate: videoBps, ...layout }, sample, progressReporter(), true);
-      videoBps = B.calibrate(videoBps, (probed.buffer.byteLength * 8) / PROBE_SECONDS);
+      const measured = (probed.buffer.byteLength * 8) / PROBE_SECONDS;
+      const before = videoBps;
+      videoBps = B.calibrate(videoBps, measured);
+      perf(`Sample pass ${PROBE_SECONDS}s of ${layout.width}x${layout.height}: ${secs(performance.now() - tProbe)} (${(PROBE_SECONDS / ((performance.now() - tProbe) / 1000)).toFixed(1)}x realtime); asked ${Math.round(before / 1000)} kbps, got ${Math.round(measured / 1000)} kbps, next ${Math.round(videoBps / 1000)} kbps, ${probed.videoCodec}`);
     } catch (e) {
       if (e instanceof Cancelled || (e instanceof FriendlyError && e.code === 'cantEncode')) throw e;
       console.warn('Sample pass failed, continuing without it', e);
@@ -574,7 +595,10 @@ async function encodeSegment(job, seg, part, queue) {
       attempt === 1 ? `Making it ${Math.min(layout.width, layout.height)}p to fit ${limitMB()} MB.` : 'Almost there. Making it a little smaller…',
       label,
     );
+    const tPass = performance.now();
     const out = await encodeOnce(info, attemptPlan, seg, progressReporter());
+    const passSecs = (performance.now() - tPass) / 1000;
+    perf(`Pass ${attempt}${part ? ` (part ${part.index}/${part.count})` : ''}: ${layout.width}x${layout.height} @${layout.fps} fps, asked ${Math.round(videoBps / 1000)} kbps; took ${passSecs.toFixed(1)} s for ${B.formatDuration(length)} of video (${(length / passSecs).toFixed(1)}x realtime); result ${B.formatBytes(out.buffer.byteLength)} ${out.buffer.byteLength <= plan.acceptBytes ? 'fits' : 'TOO BIG, redoing'}`);
     if (out.buffer.byteLength <= plan.acceptBytes) {
       setProgress(1);
       const file = new File([out.buffer], outputName(info.file.name, part), { type: 'video/mp4', lastModified: Date.now() });
@@ -643,6 +667,8 @@ function setStatus(out, text, kind) {
 }
 
 function finishAll() {
+  perf('All done');
+  el.speedLog.textContent = perfLines.join('\n');
   const ok = jobs.filter((j) => !j.error);
   const failed = jobs.filter((j) => j.error);
   const outputs = flat();
@@ -773,6 +799,8 @@ el.saveBtn.addEventListener('click', async () => {
     await new Promise((r) => setTimeout(r, 400));
   }
 });
+
+el.speedCopy.addEventListener('click', async () => flash(el.speedCopy, (await copyText(el.speedLog.textContent)) ? 'Copied ✓' : "Couldn't copy"));
 
 el.againBtn.addEventListener('click', () => {
   resetAll();
