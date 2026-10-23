@@ -1,0 +1,9 @@
+{
+  "name": "discord-reduce",
+  "private": true,
+  "description": "Shrink videos in the browser so they fit Discord's upload limit",
+  "scripts": {
+    "test": "node --test tests/budget.test.mjs",
+    "test:e2e": "node tests/e2e.mjs"
+  }
+}
