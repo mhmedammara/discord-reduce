@@ -4,7 +4,6 @@ import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 const B = window.DRBudget;
-const C = window.DRCaption;
 const { Input, ALL_FORMATS, BlobSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
 // H.264 plays everywhere in Discord. VP9 is only a fallback for browsers that cannot encode H.264.
@@ -22,7 +21,6 @@ const el = Object.fromEntries(
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
     'doneTitle', 'doneSizes', 'results', 'doneNote',
-    'capEdit', 'capEvent', 'capVenue', 'capDate', 'capNote', 'capPreview', 'copyCaption',
     'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
     'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
   ].map((id) => [id, $(id)]),
@@ -71,7 +69,6 @@ let current = null; // running Conversion
 let cancelled = false;
 let busy = false;
 let wakeLock = null;
-let dateEdited = false;
 let pendingDecision = null; // { resolve, reject } while the trim screen is open
 let trimJob = null;
 const urls = new Set();
@@ -172,13 +169,12 @@ async function analyze(file) {
     if (!video) throw new FriendlyError('novideo');
     if (!(await video.canDecode())) throw new FriendlyError('codec');
 
-    const [width, height, duration, stats, hdr, tags] = await Promise.all([
+    const [width, height, duration, stats, hdr] = await Promise.all([
       video.getDisplayWidth(),
       video.getDisplayHeight(),
       input.computeDuration(),
       video.computePacketStats(150),
       video.hasHighDynamicRange().catch(() => false),
-      input.getMetadataTags().catch(() => ({})),
     ]);
 
     let audio = null;
@@ -201,7 +197,6 @@ async function analyze(file) {
       fps: stats.averagePacketRate,
       audio,
       hdr,
-      autoDate: C.recordedDate(tags && tags.date, file.lastModified),
     };
   } catch (e) {
     input.dispose();
@@ -594,22 +589,6 @@ el.cancelBtn.addEventListener('click', async () => {
 
 const flat = () => jobs.flatMap((job) => job.outputs.map((out) => ({ job, out })));
 
-function captionFor({ job, out }) {
-  return C.build({
-    event: el.capEvent.value,
-    venue: el.capVenue.value,
-    dateISO: dateEdited ? el.capDate.value : job.info.autoDate || el.capDate.value,
-    note: el.capNote.value,
-    durationText: out.durationText,
-    part: out.part,
-  });
-}
-
-function refreshCaption() {
-  const items = flat();
-  el.capPreview.textContent = items.length ? captionFor(items[0]) : '';
-}
-
 function addCard(job, out) {
   const card = document.createElement('div');
   card.className = 'card item';
@@ -682,15 +661,6 @@ function finishAll() {
   el.doneNote.hidden = !notes.length;
   el.doneNote.textContent = notes.join(' ');
 
-  // Message fields: event and venue are remembered between clips; the date comes from the video.
-  el.capEvent.value = store.get('dr-event') || '';
-  el.capVenue.value = store.get('dr-venue') || '';
-  el.capNote.value = '';
-  dateEdited = false;
-  el.capDate.value = (outputs[0] && outputs[0].job.info.autoDate) || '';
-  el.capEdit.open = !el.capEvent.value; // first time: ask who/where; afterwards it is remembered
-  refreshCaption();
-
   // Posting and sharing options.
   const hook = loadHook();
   el.postBtn.hidden = !hook;
@@ -712,23 +682,6 @@ function finishAll() {
   el.saveBtn.textContent = canShare ? 'Save to my device' : 'Download';
   show('done');
 }
-
-for (const [input, key] of [[el.capEvent, 'dr-event'], [el.capVenue, 'dr-venue']]) {
-  input.addEventListener('input', () => {
-    store.set(key, input.value);
-    refreshCaption();
-  });
-}
-el.capNote.addEventListener('input', refreshCaption);
-el.capDate.addEventListener('input', () => {
-  dateEdited = true;
-  refreshCaption();
-});
-
-el.copyCaption.addEventListener('click', async () => {
-  const ok = await copyText(flat().map(captionFor).join('\n\n'));
-  flash(el.copyCaption, ok ? 'Copied ✓' : "Couldn't copy");
-});
 
 el.postBtn.addEventListener('click', async () => {
   const hook = loadHook();
@@ -753,7 +706,6 @@ el.postBtn.addEventListener('click', async () => {
       await postToThread({
         hook,
         username: name,
-        content: captionFor(item),
         file: out.file,
         onProgress: (p) => setStatus(out, `Posting… ${Math.round(p * 100)}%`),
       });

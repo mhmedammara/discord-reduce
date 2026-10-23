@@ -95,8 +95,6 @@
     border: 1px solid var(--line); border-radius: 12px; min-height: 48px; padding: 8px 12px; width: 100%;
   }
   input[type=text]:focus-visible, input[type=date]:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
-  h3 { font-size: 17px; margin: 0; }
-  .preview { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--bg); border: 1px dashed var(--line); font-family: inherit; font-size: 15px; line-height: 1.4; color: var(--text); }
   .item { padding: 12px; gap: 8px; display: flex; flex-direction: column; }
   .item video { max-height: 30vh; }
   .item .name { font-weight: 600; overflow-wrap: anywhere; }
@@ -199,20 +197,6 @@
     </div>
     <div id="results" class="stack"></div>
     <p class="notice warn" id="doneNote" hidden></p>
-    <div class="card stack" id="captionCard">
-      <h3>Message</h3>
-      <pre class="preview" id="capPreview" aria-label="Message preview"></pre>
-      <details id="capEdit">
-        <summary>Edit message</summary>
-        <div class="stack" style="margin-top:14px">
-          <div class="field"><label for="capEvent">Artist or event</label><input id="capEvent" type="text" maxlength="100" autocomplete="off" enterkeyhint="done"></div>
-          <div class="field"><label for="capVenue">Venue</label><input id="capVenue" type="text" maxlength="100" autocomplete="off" enterkeyhint="done"></div>
-          <div class="field"><label for="capDate">Date</label><input id="capDate" type="date"></div>
-          <div class="field"><label for="capNote">Note (optional)</label><input id="capNote" type="text" maxlength="300" autocomplete="off" enterkeyhint="done"></div>
-        </div>
-      </details>
-      <button class="btn" id="copyCaption" type="button">Copy message</button>
-    </div>
     <div class="field" id="nameField" hidden>
       <label for="posterName">Your name (shown on the post)</label>
       <input id="posterName" type="text" maxlength="60" autocomplete="nickname" enterkeyhint="done">
@@ -260,7 +244,6 @@
 </script>
 <script src="version.js"></script>
 <script src="budget.js"></script>
-<script src="caption.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>

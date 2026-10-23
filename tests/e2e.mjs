@@ -15,7 +15,6 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { encodeHook } from '../discord.mjs';
 
-const Caption = createRequire(import.meta.url)('../caption.js');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'dr-e2e-'));
 const shots = process.env.SHOTS_DIR;
@@ -365,9 +364,11 @@ await test('a short test pass runs first, and normal clips need only one full pa
   const titles = await page.evaluate(() => window.__titles);
   assert.ok(titles.includes('Checking your video…'), 'sample pass ran: ' + titles);
   assert.ok(!(await page.evaluate(() => /Almost there/.test(document.body.textContent))), 'no redo needed');
-  const shown = await page.textContent('#capPreview');
-  assert.ok(shown.includes('⏱ 0:25'), shown);
-  assert.ok(shown.includes(Caption.formatDate(Caption.toISODate(Date.now()))), 'date comes from the file: ' + shown);
+  assert.equal(await page.locator('#captionCard').count(), 0, 'no message block');
+  // without a thread link the page is the plain share/save version
+  assert.equal(await page.isVisible('#postBtn'), false, 'no post button without a link');
+  assert.equal(await page.isVisible('#nameField'), false);
+  assert.equal(await page.isVisible('#hookPrompt'), false);
   assert.deepEqual(errors, []);
   await ctx.close();
 });
@@ -391,7 +392,6 @@ await test('a long clip can be split into sharp parts', async () => {
     console.log(`   -> ${f.name} ${(r.size / 1e6).toFixed(2)} MB ${r.display.join('x')}`);
   }
   assert.ok(Math.abs(total - 100) < 1.5, `parts add up to ${total}`);
-  assert.match(await page.textContent('#capPreview'), /part 1\/2/);
   assert.deepEqual(errors, []);
   await ctx.close();
 });
@@ -420,10 +420,7 @@ await test('posting to the thread sends the file and a safe caption', async () =
   await page.setInputFiles('#file', fx.landscape);
   await visible(page, 'done');
   assert.equal(await page.isVisible('#postBtn'), true);
-  assert.equal(await page.evaluate(() => document.getElementById('capEdit').open), true, 'editor opens the first time');
   await shot(page, '9-done-with-thread');
-  await page.fill('#capEvent', 'Dua *Lipa* @everyone');
-  await page.fill('#capVenue', 'O2 Arena');
 
   await page.click('#postBtn'); // no name yet
   assert.match(await page.textContent('#postStatus'), /name/i);
@@ -437,7 +434,7 @@ await test('posting to the thread sends the file and a safe caption', async () =
   assert.match(post.url, /thread_id=1477264432139731097&wait=true$/);
   assert.equal(post.payload.username, 'Sam');
   assert.deepEqual(post.payload.allowed_mentions, { parse: [] });
-  assert.match(post.payload.content, /^🎤 \*\*Dua \\\*Lipa\\\* @​everyone\*\* · O2 Arena\n📅 .* · ⏱ 0:25$/);
+  assert.equal(post.payload.content, undefined, 'only the video is posted, no added text');
   assert.ok(post.file.size > 100_000 && post.file.size <= 10e6, 'file size ' + post.file.size);
   assert.equal(post.file.name, 'landscape-discord.mp4');
 

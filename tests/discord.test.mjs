@@ -103,3 +103,14 @@ test('a rejected username is retried with the name in the text', async () => {
   assert.equal(second.username, undefined);
   assert.equal(second.content, '**Sam**\nhello');
 });
+
+test('no text is added when none is given', async () => {
+  const srv = fakeServer([200]);
+  await postToThread({ hook, username: 'Sam', file, post: srv.post });
+  const payload = JSON.parse(srv.seen[0].form.get('payload_json'));
+  assert.equal('content' in payload, false);
+  assert.equal(payload.username, 'Sam');
+  const retry = fakeServer([{ status: 400, text: '{"username":["bad"]}' }, 200]);
+  await postToThread({ hook, username: 'Sam', file, post: retry.post });
+  assert.equal(JSON.parse(retry.seen[1].form.get('payload_json')).content, '**Sam**');
+});

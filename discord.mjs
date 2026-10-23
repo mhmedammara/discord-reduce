@@ -130,7 +130,10 @@ export async function postToThread({ hook, username, content, file, onProgress, 
   let name = safeUsername(username);
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const payload = { content: name || !username ? content : `**${username}**\n${content}`, allowed_mentions: { parse: [] } };
+    // No text is added by default; if Discord refuses the poster's name, it goes into the text instead.
+    const text = name || !username ? content : `**${username}**${content ? '\n' + content : ''}`;
+    const payload = { allowed_mentions: { parse: [] } };
+    if (text) payload.content = text;
     if (name) payload.username = name;
     const form = new FormData();
     if (file) payload.attachments = [{ id: 0, filename: file.name }];

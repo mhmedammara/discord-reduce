@@ -12,7 +12,7 @@ Everything is shrunk **on your own device**. Nothing is uploaded unless you tap 
 - **Size limit:** default **20 MB** (Discord's free limit since August 2026, per news reports; Discord's own help page wasn't reachable when this was written, so double-check it). The dropdown also offers 10 MB, in case 20 MB is rejected for you, and 50 MB for Nitro Basic.
 - **Long videos:** if a clip would come out soft, the page offers to trim it or **split it into sharp parts**.
 - **Concert mode** (on by default) keeps the sound at 128 kbps where the size allows.
-- **Message:** a caption (artist/event, venue, date, length, part 1/3…) is built for every video. The date comes from the video itself; artist and venue are remembered. Location and device info are *not* copied into the shrunk file.
+- **Privacy:** location and device info in the original are *not* copied into the shrunk file.
 - **Works offline** once opened one time.
 
 ## Put it online (one time)
@@ -28,7 +28,7 @@ It must be served over HTTPS: the video APIs it uses are disabled on plain `http
 
 ## Post straight to your thread (optional)
 
-Without this, friends use the share sheet. With it, they tap one button and the video lands in the thread with its caption.
+Without this, friends use the share sheet. With it, they tap one button and the video lands in the thread.
 
 1. In Discord on a computer: **Server Settings → Integrations → Webhooks → New Webhook**, pick the channel the thread is in, **Copy Webhook URL**. (You need the Manage Webhooks permission.)
 2. Copy the link to the thread (long-press or right-click the thread → **Copy Link**).
@@ -54,7 +54,7 @@ If a link opened inside Discord doesn't work, tap the menu and choose "Open in b
 
 ## How it works
 
-`app.js` uses [Mediabunny](https://github.com/Vanilagy/mediabunny) (WebCodecs) to decode the video, scale it, re-encode it with the device's hardware H.264 encoder and write a fast-start MP4. `budget.js` works out the bitrate, resolution and frame rate that fit the limit (about 7% under it). Before the real run a 4-second sample is encoded to see how the phone's encoder behaves, so the real run is usually right first time; if it still lands over the limit it is redone smaller. Sound that is already AAC is copied unchanged; otherwise it is re-encoded to AAC (a bundled WebAssembly encoder is used on browsers without one). `caption.js` builds the message, `discord.mjs` posts it.
+`app.js` uses [Mediabunny](https://github.com/Vanilagy/mediabunny) (WebCodecs) to decode the video, scale it, re-encode it with the device's hardware H.264 encoder and write a fast-start MP4. `budget.js` works out the bitrate, resolution and frame rate that fit the limit (about 7% under it). Before the real run a 4-second sample is encoded to see how the phone's encoder behaves, so the real run is usually right first time; if it still lands over the limit it is redone smaller. Sound that is already AAC is copied unchanged; otherwise it is re-encoded to AAC (a bundled WebAssembly encoder is used on browsers without one). `discord.mjs` posts it.
 
 ## Check an iPhone without owning one
 
@@ -68,7 +68,7 @@ Then, on the real site, ask them to:
 ## Development
 
 ```
-npm test                      # unit tests: sizing, captions, webhook, vendored files
+npm test                      # unit tests: sizing, webhook, vendored files
 node tests/e2e.mjs            # needs ffmpeg/ffprobe and Playwright's Chromium
 python3 -m http.server        # then open http://localhost:8000
 ```
@@ -80,7 +80,7 @@ Bump `version.js` on every release (it names the offline cache and shows in the 
 ## Security notes
 
 - No code is loaded from other sites; the libraries are vendored and pinned (`vendor/SHA256SUMS`, checked by a test). The page's Content-Security-Policy limits network requests to itself and Discord.
-- Everything typed by users is inserted as text, and captions are escaped so they can't become formatting or pings.
+- Everything typed by users is inserted as text, and posts have mentions switched off.
 - The service worker only handles this site's own files, never Discord traffic.
 
 ## Third-party code

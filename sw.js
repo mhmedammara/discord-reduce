@@ -4,7 +4,7 @@ importScripts('version.js');
 
 const CACHE = 'dr-' + DR_VERSION;
 const CORE = [
-  './', 'index.html', 'app.js', 'budget.js', 'caption.js', 'discord.mjs', 'version.js', 'manifest.webmanifest',
+  './', 'index.html', 'app.js', 'budget.js', 'discord.mjs', 'version.js', 'manifest.webmanifest',
   'icon-192.png', 'icon-512.png', 'icon-180.png', 'vendor/mediabunny.min.mjs',
 ];
 const HEAVY = ['vendor/mediabunny-aac-encoder.min.mjs']; // only some iPhones need this one; cached best-effort
