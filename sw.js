@@ -12,8 +12,9 @@ const HEAVY = ['vendor/mediabunny-aac-encoder.min.mjs']; // only some iPhones ne
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE).then(async (cache) => {
-      await cache.addAll(CORE);
-      await Promise.all(HEAVY.map((url) => cache.add(url).catch(() => {})));
+      // 'reload' skips the browser's own cache, so a new release never stores stale copies of its files.
+      await Promise.all(CORE.map((url) => cache.add(new Request(url, { cache: 'reload' }))));
+      await Promise.all(HEAVY.map((url) => cache.add(new Request(url, { cache: 'reload' })).catch(() => {})));
     }),
   );
   self.skipWaiting();
@@ -42,7 +43,9 @@ self.addEventListener('fetch', (event) => {
         if (hit) return hit;
       }
       try {
-        const res = await fetch(req);
+        // 'no-cache' = always ask the server whether the file changed (cheap when it has not). Without it the
+        // browser may keep handing out a 10-minute-old copy, which is why a new version looked stuck.
+        const res = await fetch(req.mode === 'navigate' ? req.url : req, { cache: 'no-cache' });
         if (res.ok && res.type === 'basic') cache.put(req, res.clone());
         return res;
       } catch (e) {

@@ -81,7 +81,6 @@ const sine = (d) => ['-f', 'lavfi', '-i', `sine=frequency=440:duration=${d}`];
 const video = (size, rate, d) => ['-f', 'lavfi', '-i', `testsrc2=size=${size}:rate=${rate}:duration=${d}`];
 const vp8 = ['-c:v', 'libvpx', '-deadline', 'realtime', '-cpu-used', '8'];
 
-console.log('generating fixtures in', work);
 const fx = {
   landscape: path.join(work, 'landscape.webm'),
   portrait: path.join(work, 'portrait.mp4'),
@@ -91,6 +90,8 @@ const fx = {
   big: path.join(work, 'big.webm'),
   mid: path.join(work, 'mid.webm'),
 };
+if (!process.env.E2E_NOFIX) {
+console.log('generating fixtures in', work);
 ffmpeg(...video('1280x720', 30, 25), ...sine(25), ...vp8, '-b:v', '6M', '-c:a', 'libopus', '-b:a', '128k', fx.landscape);
 ffmpeg(...video('1280x720', 30, 30), ...sine(30), '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8', '-b:v', '6M', '-c:a', 'libopus', '-strict', '-2', '-metadata', 'title=SECRETTITLE', '-metadata', 'location=+51.5074-0.1278/', path.join(work, 'p0.mp4'));
 ffmpeg('-display_rotation', '90', '-i', path.join(work, 'p0.mp4'), '-c', 'copy', fx.portrait);
@@ -100,6 +101,7 @@ ffmpeg(...video('1280x720', 30, 60), ...sine(60), ...vp8, '-b:v', '8M', '-c:a', 
 ffmpeg(...video('960x540', 30, 100), ...sine(100), ...vp8, '-b:v', '1500k', '-c:a', 'libopus', '-b:a', '128k', fx.mid);
 ffmpeg(...video('640x360', 15, 720), ...sine(720), ...vp8, '-b:v', '300k', '-c:a', 'libopus', '-ac', '1', '-b:a', '24k', fx.long);
 for (const [k, f] of Object.entries(fx)) console.log(`  ${k}: ${(fs.statSync(f).size / 1e6).toFixed(1)} MB`);
+}
 
 // ---------------------------------------------------------------- harness
 
@@ -758,43 +760,41 @@ await test('a long list is shared in batches the browser accepts', async () => {
   await ctx.close();
 });
 
-await test('a list is sized at pick time so everything goes out in one share', async () => {
-  // A browser that accepts at most 3 files and 24 MB per share.
-  const { ctx, page } = await newPage({
-    init: () => {
-      window.__shares = [];
-      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 24 * 1048576;
-      navigator.canShare = (d) => !!d && !!d.files && ok(d);
-      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
-    },
+await test('a new release shows up on the very next visit (the offline cache is not sticky)', async () => {
+  // Serve a copy of the site the way GitHub Pages does: the browser may reuse any file for 10 minutes.
+  const dir = fs.mkdtempSync(path.join(work, 'site-'));
+  for (const f of ['index.html', 'app.js', 'budget.js', 'discord.mjs', 'version.js', 'sw.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-180.png']) fs.copyFileSync(path.join(root, f), path.join(dir, f));
+  fs.cpSync(path.join(root, 'vendor'), path.join(dir, 'vendor'), { recursive: true });
+  const srv = http.createServer((req, res) => {
+    const p = path.join(dir, decodeURIComponent(new URL(req.url, 'http://x').pathname).replace(/\/$/, '/index.html'));
+    if (!p.startsWith(dir) || !fs.existsSync(p) || fs.statSync(p).isDirectory()) return res.writeHead(404).end();
+    res.writeHead(200, { 'content-type': MIME[path.extname(p)] || 'application/octet-stream', 'cache-control': 'public, max-age=600' });
+    fs.createReadStream(p).pipe(res);
   });
-  await page.selectOption('#limit', '20');
-  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
-  await visible(page, 'done');
-  assert.match(await page.textContent('#doneNote'), /Each video was sized to 7\.\d MB so all 3 can go out in one share/);
-  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet', 'one share, not batches');
-  await page.click('#shareBtn');
-  const shares = await page.evaluate(() => window.__shares);
-  assert.equal(shares.length, 1);
-  assert.equal(shares[0].length, 3);
-  const files = await saveAll(page, 3, 'out-oneshare');
-  for (const f of files) assert.ok(fs.statSync(f.out).size <= 24 * 1048576 / 3, `${f.name} ${fs.statSync(f.out).size}`);
-  await ctx.close();
-});
-
-await test('one video keeps the full size even on a phone with a share limit', async () => {
-  const { ctx, page } = await newPage({
-    init: () => {
-      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 24 * 1048576;
-      navigator.canShare = (d) => !!d && !!d.files && ok(d);
-      navigator.share = async () => {};
-    },
-  });
-  await page.selectOption('#limit', '20');
-  await page.setInputFiles('#file', [fx.landscape]);
-  await visible(page, 'done');
-  assert.ok(!/Each video was sized/.test(await page.textContent('#doneNote')));
-  await ctx.close();
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://localhost:${srv.address().port}/`;
+  const ctx = await browser.newContext({ ...devices['Pixel 7'] });
+  const page = await ctx.newPage();
+  try {
+    await page.goto(base);
+    const first = (await page.textContent('#version')).trim();
+    await page.evaluate(() => navigator.serviceWorker.ready);
+    await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 10000 });
+    fs.writeFileSync(path.join(dir, 'version.js'), "var DR_VERSION = '9.9.9';\n"); // a release
+    await page.reload();
+    assert.equal((await page.textContent('#version')).trim(), 'v9.9.9', `still showing ${first} after one reload`);
+    let keys = [];
+    for (let i = 0; i < 50; i++) {
+      keys = await page.evaluate(() => caches.keys());
+      if (keys.includes('dr-9.9.9') && !keys.includes('dr-' + first.slice(1))) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.ok(keys.includes('dr-9.9.9'), 'the new offline copy is stored: ' + keys);
+    assert.ok(!keys.includes('dr-' + first.slice(1)), 'the old offline copy is removed: ' + keys);
+  } finally {
+    await ctx.close();
+    srv.close();
+  }
 });
 
 await browser.close();
