@@ -723,7 +723,7 @@ await test('a phone that only lets the page read picked files for 1.5 s still ge
 });
 
 await test('a phone with little memory copies fewer videos but still makes them all', async () => {
-  const { ctx, page } = await newPage({ init: () => Object.defineProperty(navigator, 'deviceMemory', { value: 0.25 }) });
+  const { ctx, page } = await newPage({ init: () => Object.defineProperty(navigator, 'deviceMemory', { value: 0.05 }) });
   await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.noaudio]);
   await visible(page, 'done');
   assert.equal(await page.locator('#results .item video').count(), 3);
@@ -746,9 +746,11 @@ await test('a long list is shared in batches the browser accepts', async () => {
   assert.equal(await page.isVisible('#shareBtn'), true, 'share button is there');
   assert.equal(await page.textContent('#shareBtn'), 'Send videos 1–2 of 3');
   await page.click('#shareBtn');
+  assert.match(await page.textContent('#shareStatus'), /Sent 2 of 3\. Tap the button again/);
   assert.equal(await page.textContent('#shareBtn'), 'Send video 3 of 3');
   await page.click('#shareBtn');
   assert.equal(await page.textContent('#shareBtn'), 'All sent ✓');
+  assert.equal(await page.textContent('#shareStatus'), 'All 3 sent.');
   const shares = await page.evaluate(() => window.__shares);
   assert.equal(shares.length, 2, JSON.stringify(shares));
   assert.ok(shares.every((g) => g.length <= 2), JSON.stringify(shares));

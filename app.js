@@ -21,7 +21,7 @@ const el = Object.fromEntries(
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
     'doneTitle', 'doneSizes', 'results', 'doneNote', 'repickBtn',
-    'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'saveBtn', 'againBtn',
+    'nameField', 'posterName', 'postBtn', 'postStatus', 'shareBtn', 'shareStatus', 'saveBtn', 'againBtn',
     'errTitle', 'errMsg', 'errDetail', 'errCopy', 'errBack', 'unsupportedMsg', 'version',
   ].map((id) => [id, $(id)]),
 );
@@ -271,10 +271,12 @@ document.addEventListener('drop', (e) => {
 // Phones only let the page read a picked file for a short while after it was picked (later videos of a list
 // failed with "The requested file could not be read ... permission problems"). So when several videos are
 // picked, reading ALL of them starts at once, in the same instant as the pick, and the copies are kept in memory.
-// How much may be held at once depends on the phone's memory (Chrome reports it; Safari does not, so assume little).
+// The copies are Files, which the browser keeps in its own blob storage and pages out to disk when memory is
+// short, so only an extreme list needs a ceiling. (An earlier, much lower ceiling made the last videos of a
+// list of seven fail.) Chrome reports the phone's memory; Safari does not, so assume less.
 const MEMORY_GB = navigator.deviceMemory || 2;
-const COPY_TOTAL_MAX = Math.min(800e6, MEMORY_GB * 100e6); // a 4 GB phone holds up to 400 MB of copies
-const COPY_FILE_MAX = Math.min(250e6, COPY_TOTAL_MAX);
+const COPY_TOTAL_MAX = Math.min(2e9, MEMORY_GB * 500e6); // a 4 GB phone: 2 GB
+const COPY_FILE_MAX = Math.min(1e9, COPY_TOTAL_MAX);
 function startCopies(files) {
   let room = COPY_TOTAL_MAX;
   return files.map((f) => {
@@ -802,6 +804,7 @@ function finishAll() {
   el.postBtn.textContent = outputs.length > 1 ? 'Post all to the thread' : 'Post to the thread';
   el.posterName.value = store.get('dr-name') || '';
   shareNext = 0;
+  el.shareStatus.hidden = true;
   updateShareButton();
   const canShare = !el.shareBtn.hidden;
   el.shareBtn.classList.toggle('primary', canShare && !hook);
@@ -909,6 +912,10 @@ el.shareBtn.addEventListener('click', async () => {
     await navigator.share({ files: batch });
     shareNext += batch.length;
     updateShareButton();
+    const total = flat().length;
+    el.shareStatus.hidden = false;
+    el.shareStatus.textContent =
+      shareNext >= total ? `All ${total} sent.` : `Sent ${shareNext} of ${total}. Tap the button again to send the next ones.`;
   } catch (e) {
     if (e && e.name === 'AbortError') return;
     el.doneNote.hidden = false;
