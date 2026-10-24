@@ -4,7 +4,7 @@ import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 // Must match version.js; bumped together on every release.
-const APP_VERSION = '1.1.24';
+const APP_VERSION = '1.1.25';
 const B = window.DRBudget;
 const { Input, ALL_FORMATS, BlobSource, BufferSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
@@ -18,7 +18,7 @@ const SOFT_BELOW = 480; // asking about trim/split when the picture would drop b
 const $ = (id) => document.getElementById(id);
 const el = Object.fromEntries(
   [
-    'file', 'limit', 'pickHint', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
+    'file', 'chooseBtn', 'limit', 'pickHint', 'trimFirst', 'hookStatus', 'hookThread', 'hookForget', 'hookPrompt', 'hookPromptText', 'hookConnect', 'hookIgnore', 'inAppBanner', 'postTo',
     'trimQueue', 'trimVideo', 'trimInfo', 'trimStart', 'trimEnd', 'trimStartLabel', 'trimEndLabel', 'trimSummary',
     'trimGo', 'trimSplit', 'trimBack',
     'workTitle', 'workQueue', 'workStatus', 'bar', 'pct', 'eta', 'cancelBtn',
@@ -300,9 +300,13 @@ function perShare() {
 }
 
 function refreshPickHint() {
+  // A web page cannot cap the phone's picker at "N videos", so the button says the number, and when only one
+  // fits, the picker only lets one be chosen.
+  const n = shareLimited() ? perShare() : SHARE_MAX_FILES;
+  el.file.multiple = n > 1;
+  el.chooseBtn.textContent = n === 1 ? 'Choose a video' : shareLimited() ? `Choose up to ${n} videos` : 'Choose videos';
   el.pickHint.hidden = !shareLimited();
   if (el.pickHint.hidden) return;
-  const n = perShare();
   el.pickHint.textContent =
     n === 1
       ? 'Pick 1 video at a time: that is what fits in one share to Discord at full quality.'

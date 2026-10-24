@@ -971,6 +971,12 @@ await test('quality first: each video stays just under the limit, and a pick tak
   assert.equal(await page.textContent('#pickHint'), 'Pick up to 5 videos at a time: that is what fits in one share to Discord at full quality.');
   await page.selectOption('#limit', '20');
   assert.equal(await page.textContent('#pickHint'), 'Pick up to 2 videos at a time: that is what fits in one share to Discord at full quality.');
+  assert.equal((await page.textContent('#chooseBtn')).trim(), 'Choose up to 2 videos');
+  assert.equal(await page.$eval('#file', (i) => i.multiple), true);
+  await page.selectOption('#limit', '50');
+  assert.equal((await page.textContent('#chooseBtn')).trim(), 'Choose a video');
+  assert.equal(await page.$eval('#file', (i) => i.multiple), false, 'only one can be picked when only one fits');
+  await page.selectOption('#limit', '20');
   // ~19 + 15 + 15 MB already fit 20 MB and together fit 50 MiB; the 61 MB one would not fit in the same share
   await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait, fx.big]);
   await visible(page, 'done');
