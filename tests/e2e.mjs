@@ -772,32 +772,6 @@ await test('a new release shows up on the very next visit (the offline cache is 
   }
 });
 
-await test('picking more than one share can carry: only that many are taken, and the rest are named', async () => {
-  // A browser that accepts at most 3 files and 45 MiB per share: with a 20 MB limit that is 2 videos.
-  const { ctx, page } = await newPage({
-    init: () => {
-      window.__shares = [];
-      const ok = (d) => d.files.length <= 3 && d.files.reduce((n, f) => n + f.size, 0) <= 45 * 1048576;
-      navigator.canShare = (d) => !!d && !!d.files && ok(d);
-      navigator.share = async (d) => { if (!ok(d)) throw new DOMException('too much', 'NotAllowedError'); window.__shares.push(d.files.map((f) => f.name)); };
-    },
-  });
-  await page.selectOption('#limit', '20');
-  assert.equal(await page.textContent('#pickHint'), 'This phone sends up to 2 videos in one share, so pick up to 2 at a time.');
-  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
-  await visible(page, 'done');
-  assert.equal(await page.locator('#results .item').count(), 2);
-  assert.match(await page.textContent('#doneNote'), /only the first 2 were done\. Not done yet: portrait\.mp4\. Pick it next\./);
-  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet');
-  await page.click('#shareBtn');
-  const shares = await page.evaluate(() => window.__shares);
-  assert.deepEqual(shares.map((g) => g.length), [2], 'everything in one share');
-  await page.click('#againBtn');
-  await page.selectOption('#limit', '10'); // a smaller limit fits more per share
-  assert.match(await page.textContent('#pickHint'), /up to 3 videos/);
-  await ctx.close();
-});
-
 await test('a single video is copied at the moment it is picked', async () => {
   // The original turns unreadable 1.5 s after the pick, long before the 25 s video is finished.
   const { ctx, page } = await newPage({
@@ -926,36 +900,126 @@ await test('everything converted goes out in ONE share when the browser accepts 
   await ctx.close();
 });
 
-await test('a phone that refuses big shares is learned once; the next pick is capped so it goes out in one tap', async () => {
-  // canShare says yes to anything, but the real share refuses more than 2 files (like a phone-side limit).
+await test('refusals are halved (9 refused -> 5 -> 3), never one tap per number; the pick is then capped', async () => {
+  // canShare says yes to anything, but the real share refuses more than 4 files (the user's phone).
+  const { ctx, page } = await newPage({
+    init: () => {
+      window.__shares = [];
+      window.__refused = [];
+      navigator.canShare = (d) => !!d && !!d.files;
+      navigator.share = async (d) => {
+        if (d.files.length > 4) {
+          window.__refused.push(d.files.length);
+          throw new DOMException('Permission denied', 'NotAllowedError');
+        }
+        window.__shares.push(d.files.length);
+      };
+    },
+  });
+  const nine = Array.from({ length: 9 }, (_, i) => {
+    const p = path.join(work, `clip${i + 1}.webm`);
+    fs.copyFileSync(fx.small, p);
+    return p;
+  });
+  await page.setInputFiles('#file', nine);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item').count(), 9);
+  for (let i = 0; i < 8 && (await page.isEnabled('#shareBtn')); i++) await page.click('#shareBtn');
+  assert.deepEqual(await page.evaluate(() => window.__refused), [9, 5], 'two refusals, not five');
+  assert.equal((await page.evaluate(() => window.__shares)).reduce((a, b) => a + b, 0), 9, 'all nine sent');
+  assert.equal(await page.textContent('#shareBtn'), 'All sent ✓');
+  await ctx.close();
+});
+
+await test("never more than Discord's 10 per message: 12 picked, 10 taken, 2 named", async () => {
+  const { ctx, page } = await newPage({
+    init: () => {
+      navigator.canShare = (d) => !!d && !!d.files;
+      navigator.share = async () => {};
+    },
+  });
+  const twelve = Array.from({ length: 12 }, (_, i) => {
+    const p = path.join(work, `take${i + 1}.webm`);
+    fs.copyFileSync(fx.small, p);
+    return p;
+  });
+  assert.equal(await page.textContent('#pickHint'), 'Up to 10 videos at a time. They all go to Discord in one share.');
+  await page.setInputFiles('#file', twelve);
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item').count(), 10);
+  assert.match(await page.textContent('#doneNote'), /Not done yet: take11\.webm, take12\.webm/);
+  await ctx.close();
+});
+
+// Chrome on Android, as written in Chromium (ShareServiceImpl): a share over 10 files or 50 MiB is refused,
+// but canShare() says yes to anything.
+const chromeAndroidShare = () => {
+  window.__shares = [];
+  window.__refused = [];
+  navigator.canShare = (d) => !!d && !!d.files;
+  navigator.share = async (d) => {
+    const bytes = d.files.reduce((n, f) => n + f.size, 0);
+    if (d.files.length > 10 || bytes > 50 * 1048576) {
+      window.__refused.push(d.files.length);
+      throw new DOMException('Permission denied', 'NotAllowedError');
+    }
+    window.__shares.push(d.files.length);
+  };
+};
+
+await test('the bottleneck is the limit: 4 videos that would total over 50 MiB are sized to go out in ONE share', async () => {
+  const { ctx, page } = await newPage({ init: chromeAndroidShare });
+  await page.selectOption('#limit', '20');
+  assert.equal(await page.textContent('#pickHint'), 'Up to 10 videos at a time. They all go to Discord in one share.');
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait, fx.big]); // ~19+15+15+61 MB picked
+  await visible(page, 'done');
+  assert.equal(await page.locator('#results .item video').count(), 4);
+  assert.equal(await page.isVisible('#trimSplit'), false);
+  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet');
+  await page.click('#shareBtn');
+  assert.deepEqual(await page.evaluate(() => window.__refused), [], 'never refused');
+  assert.deepEqual(await page.evaluate(() => window.__shares), [4], 'one share, all four');
+  assert.equal(await page.textContent('#shareStatus'), 'All 4 sent.');
+  const files = await saveAll(page, 4, 'out-fit');
+  const total = files.reduce((n, f) => n + fs.statSync(f.out).size, 0);
+  assert.ok(total <= 50 * 1048576, `total ${total}`);
+  await ctx.close();
+});
+
+await test('one or two videos keep the full size', async () => {
+  const { ctx, page } = await newPage({ init: chromeAndroidShare });
+  await page.selectOption('#limit', '20');
+  await page.setInputFiles('#file', [fx.big, fx.landscape]);
+  await visible(page, 'done');
+  const files = await saveAll(page, 2, 'out-two');
+  const big = files.find((f) => /big/.test(f.name));
+  assert.ok(fs.statSync(big.out).size > 15e6, 'the big one is shrunk to the normal ~19 MB, not less');
+  await page.click('#shareBtn');
+  assert.deepEqual(await page.evaluate(() => window.__shares), [2]);
+  await ctx.close();
+});
+
+await test('if a phone still refuses, the next group is halved quietly', async () => {
+  // A phone stricter than Chrome: more than 2 files is refused.
   const { ctx, page } = await newPage({
     init: () => {
       window.__shares = [];
       navigator.canShare = (d) => !!d && !!d.files;
       navigator.share = async (d) => {
         if (d.files.length > 2) throw new DOMException('Permission denied', 'NotAllowedError');
-        window.__shares.push(d.files.map((f) => f.name));
+        window.__shares.push(d.files.length);
       };
     },
   });
-  await page.selectOption('#limit', '20');
   await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
   await visible(page, 'done');
-  await page.click('#shareBtn'); // refused
-  assert.match(await page.textContent('#shareStatus'), /refused 3 videos in one share/);
+  await page.click('#shareBtn');
+  assert.equal(await page.textContent('#shareStatus'), 'Your phone wants smaller groups. Tap the button again.');
   assert.equal(await page.textContent('#shareBtn'), 'Send videos 1–2 of 3');
   await page.click('#shareBtn');
   await page.click('#shareBtn');
-  assert.deepEqual((await page.evaluate(() => window.__shares)).map((g) => g.length), [2, 1]);
-  await page.click('#againBtn');
-  await visible(page, 'idle');
-  assert.equal(await page.textContent('#pickHint'), 'This phone sends up to 2 videos in one share, so pick up to 2 at a time.');
-  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait]);
-  await visible(page, 'done');
-  assert.equal(await page.locator('#results .item').count(), 2);
-  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet');
-  await page.click('#shareBtn');
-  assert.deepEqual((await page.evaluate(() => window.__shares)).map((g) => g.length), [2, 1, 2]);
+  assert.deepEqual(await page.evaluate(() => window.__shares), [2, 1]);
+  assert.equal(await page.textContent('#shareBtn'), 'All sent ✓');
   await ctx.close();
 });
 
