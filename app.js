@@ -4,7 +4,7 @@ import * as MB from 'mediabunny';
 import { loadHook, saveHook, forgetHook, captureHookFromLocation, describeHook, sameHook, postToThread, PostError, POST_MESSAGES } from './discord.mjs';
 
 // Must match version.js; bumped together on every release.
-const APP_VERSION = '1.1.23';
+const APP_VERSION = '1.1.24';
 const B = window.DRBudget;
 const { Input, ALL_FORMATS, BlobSource, BufferSource, Output, BufferTarget, Mp4OutputFormat, Conversion, ConversionCanceledError, Quality } = MB;
 
@@ -107,15 +107,12 @@ function resetAll(keepInput = false) {
   if (!keepInput) {
     repick = null;
     leftOver = [];
-    batchLimitMB = null;
   }
   if (!keepInput) el.file.value = ''; // clearing it early can release the picked file on some phones
 }
 
 const chosenLimitMB = () => Number(el.limit.value) || 20;
-// While a pick of several videos is being made, each gets a size that lets the whole pick fit in one share.
-let batchLimitMB = null;
-const limitMB = () => (batchLimitMB ? Math.min(batchLimitMB, chosenLimitMB()) : chosenLimitMB());
+const limitMB = chosenLimitMB;
 const concert = () => true; // these are concert videos: the sound always gets the bigger share
 
 // ---------------------------------------------------------------- screens
@@ -176,7 +173,10 @@ try {
   const saved = store.get('dr-limit');
   if (saved && [...el.limit.options].some((o) => o.value === saved)) el.limit.value = saved;
 } catch {}
-el.limit.addEventListener('change', () => store.set('dr-limit', el.limit.value));
+el.limit.addEventListener('change', () => {
+  store.set('dr-limit', el.limit.value);
+  refreshPickHint();
+});
 
 // ---------------------------------------------------------------- analysis
 
@@ -265,24 +265,48 @@ const needsDecision = (plan) => plan.quality === 'low' || Math.min(plan.width, p
 // Chrome on Android refuses a share of more than 10 files or more than 50 MiB in total (Chromium's
 // ShareServiceImpl: MAX_SHARED_FILE_COUNT = 10, MAX_SHARED_FILE_BYTES = 50 MiB). It only checks when the share
 // happens, so canShare() says yes to anything. Discord also takes at most 10 files per message.
-// That is the limit the page works to: one pick = at most 10 videos, sized so that together they go out in ONE
-// share. One or two videos keep the full Discord size; more videos are made a little smaller each.
+// That is the limit the page works to, quality first: every video stays just under the Discord size limit, and
+// one pick takes as many videos as fit in one share at that size (about 2 at 20 MB, 5 at 10 MB, up to 10).
 const SHARE_MAX_FILES = 10;
 const ANDROID_CHROME = /Android/.test(navigator.userAgent) && /Chrome\//.test(navigator.userAgent);
 const SHARE_MAX_BYTES = ANDROID_CHROME ? 50 * 1048576 : Infinity;
 const canShareFiles = () => !!(navigator.share && navigator.canShare);
+const shareLimited = () => canShareFiles() && !loadHook(); // posting to a thread sends one video per message
 
-/** Size per video (MB) so that `count` videos fit in one share, or null when the normal limit already fits. */
-function sizeForPick(count) {
-  if (count < 2 || loadHook() || !canShareFiles() || !Number.isFinite(SHARE_MAX_BYTES)) return null;
-  const perVideo = (SHARE_MAX_BYTES * 0.95) / count / 1e6;
-  return perVideo < chosenLimitMB() ? Math.floor(perVideo * 10) / 10 : null;
+/** The most a finished video can weigh: as it is when already small enough, otherwise just under the limit. */
+function finishedSize(file) {
+  const limit = chosenLimitMB() * 1e6;
+  return B.fitsAlready(file.size, chosenLimitMB()) ? file.size : limit * 0.99;
+}
+
+/** The first videos of a pick that, at full quality, fit together in one share. Always at least one. */
+function takeForOneShare(picked) {
+  if (!shareLimited()) return picked.slice(0, SHARE_MAX_FILES);
+  const taken = [];
+  let bytes = 0;
+  for (const f of picked) {
+    const size = finishedSize(f);
+    if (taken.length && (taken.length >= SHARE_MAX_FILES || bytes + size > SHARE_MAX_BYTES * 0.98)) break;
+    taken.push(f);
+    bytes += size;
+  }
+  return taken;
+}
+
+/** How many full-size videos fit in one share (for the hint). */
+function perShare() {
+  if (!Number.isFinite(SHARE_MAX_BYTES)) return SHARE_MAX_FILES;
+  return Math.max(1, Math.min(SHARE_MAX_FILES, Math.floor((SHARE_MAX_BYTES * 0.98) / (chosenLimitMB() * 1e6 * 0.99))));
 }
 
 function refreshPickHint() {
-  const show = canShareFiles() && !loadHook();
-  el.pickHint.hidden = !show;
-  if (show) el.pickHint.textContent = `Up to ${SHARE_MAX_FILES} videos at a time. They all go to Discord in one share.`;
+  el.pickHint.hidden = !shareLimited();
+  if (el.pickHint.hidden) return;
+  const n = perShare();
+  el.pickHint.textContent =
+    n === 1
+      ? 'Pick 1 video at a time: that is what fits in one share to Discord at full quality.'
+      : `Pick up to ${n} videos at a time: that is what fits in one share to Discord at full quality.`;
 }
 
 // ---------------------------------------------------------------- picking files
@@ -388,10 +412,9 @@ async function runJob(i) {
 
 async function onFiles(picked) {
   if (busy || !picked.length) return;
-  // First thing, before anything else can take time: keep what one share can carry, and start reading it.
-  const files = picked.slice(0, SHARE_MAX_FILES);
-  leftOver = picked.slice(SHARE_MAX_FILES);
-  batchLimitMB = sizeForPick((repick ? repick.filter((j) => !j.error).length : 0) + files.length);
+  // First thing, before anything else can take time: keep what one share carries at full quality, start reading it.
+  const files = takeForOneShare(picked);
+  leftOver = picked.slice(files.length);
   const copies = startCopies(files); // the phone's permission to read a picked video is short-lived
   busy = true;
   cancelled = false;
@@ -474,11 +497,6 @@ async function processJob(job, index, total) {
 
 /** Decide trim/split for a video: only asks when the result would be soft, or when the user wants to trim. */
 async function decide(job, reason, queue) {
-  if (batchLimitMB && !el.trimFirst.checked) {
-    // Sized to fit one share: no questions per video (splitting would add videos and break the one share).
-    if (reason === 'big') throw new FriendlyError('toobig');
-    return { trim: null, parts: null };
-  }
   const plan = makePlan(job.info, job.info.duration, false);
   if (!reason && !el.trimFirst.checked && !needsDecision(plan)) return { trim: null, parts: null };
   return askTrim(job, reason || (needsDecision(plan) ? 'long' : null), queue);
@@ -516,7 +534,7 @@ function updateTrim(changed) {
   const parts = B.splitParts(start, end, limitMB(), concert());
   if (soft && parts.length > 1) text += ` Splitting it into ${parts.length} parts keeps each one sharp.`;
   el.trimSummary.textContent = text;
-  el.trimSplit.hidden = parts.length < 2 || !!batchLimitMB;
+  el.trimSplit.hidden = parts.length < 2;
   el.trimSplit.textContent = `Split into ${parts.length} parts`;
   // When splitting is on offer it is the default (sharper); keeping one video is the quieter choice.
   const splitFirst = parts.length > 1;
@@ -851,7 +869,7 @@ function finishAll() {
   const notes = [...new Set(outputs.map((o) => o.out.note).filter(Boolean))];
   if (leftOver.length) {
     notes.unshift(
-      `One share takes ${SHARE_MAX_FILES} videos, so only the first ${SHARE_MAX_FILES} were done. ` +
+      `One share to Discord fits ${jobs.length} ${jobs.length === 1 ? 'video' : 'videos'} at full quality, so only ${jobs.length === 1 ? 'the first was' : 'the first ' + jobs.length + ' were'} done. ` +
         `Not done yet: ${leftOver.map((f) => f.name).join(', ')}. Pick ${leftOver.length === 1 ? 'it' : 'them'} next.`,
     );
   }
@@ -921,8 +939,8 @@ el.postBtn.addEventListener('click', async () => {
   }
 });
 
-// One tap sends the whole pick: it was sized to fit one share (see "the bottleneck" above). Should a phone still
-// refuse, the refused size is remembered and the next group is halved, quietly.
+// One tap sends the whole pick: only what fits one share was taken (see "the bottleneck" above). Should a phone
+// still refuse, the refused size is remembered and the next group is halved, quietly.
 let shareNext = 0; // index of the first video not yet sent
 
 function learnedShareLimit() {

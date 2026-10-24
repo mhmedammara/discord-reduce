@@ -943,7 +943,6 @@ await test("never more than Discord's 10 per message: 12 picked, 10 taken, 2 nam
     fs.copyFileSync(fx.small, p);
     return p;
   });
-  assert.equal(await page.textContent('#pickHint'), 'Up to 10 videos at a time. They all go to Discord in one share.');
   await page.setInputFiles('#file', twelve);
   await visible(page, 'done');
   assert.equal(await page.locator('#results .item').count(), 10);
@@ -967,25 +966,30 @@ const chromeAndroidShare = () => {
   };
 };
 
-await test('the bottleneck is the limit: 4 videos that would total over 50 MiB are sized to go out in ONE share', async () => {
+await test('quality first: each video stays just under the limit, and a pick takes only what fits ONE share', async () => {
   const { ctx, page } = await newPage({ init: chromeAndroidShare });
+  assert.equal(await page.textContent('#pickHint'), 'Pick up to 5 videos at a time: that is what fits in one share to Discord at full quality.');
   await page.selectOption('#limit', '20');
-  assert.equal(await page.textContent('#pickHint'), 'Up to 10 videos at a time. They all go to Discord in one share.');
-  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait, fx.big]); // ~19+15+15+61 MB picked
+  assert.equal(await page.textContent('#pickHint'), 'Pick up to 2 videos at a time: that is what fits in one share to Discord at full quality.');
+  // ~19 + 15 + 15 MB already fit 20 MB and together fit 50 MiB; the 61 MB one would not fit in the same share
+  await page.setInputFiles('#file', [fx.landscape, fx.noaudio, fx.portrait, fx.big]);
   await visible(page, 'done');
-  assert.equal(await page.locator('#results .item video').count(), 4);
-  assert.equal(await page.isVisible('#trimSplit'), false);
-  assert.equal(await page.textContent('#shareBtn'), 'Send with the share sheet');
+  assert.equal(await page.locator('#results .item').count(), 3);
+  assert.match(await page.textContent('#doneNote'), /One share to Discord fits 3 videos at full quality, so only the first 3 were done\. Not done yet: big\.webm\. Pick it next\./);
   await page.click('#shareBtn');
   assert.deepEqual(await page.evaluate(() => window.__refused), [], 'never refused');
-  assert.deepEqual(await page.evaluate(() => window.__shares), [4], 'one share, all four');
-  assert.equal(await page.textContent('#shareStatus'), 'All 4 sent.');
-  const files = await saveAll(page, 4, 'out-fit');
-  const total = files.reduce((n, f) => n + fs.statSync(f.out).size, 0);
-  assert.ok(total <= 50 * 1048576, `total ${total}`);
+  assert.deepEqual(await page.evaluate(() => window.__shares), [3], 'one share');
+  const files = await saveAll(page, 3, 'out-fit');
+  assert.ok(files.reduce((n, f) => n + fs.statSync(f.out).size, 0) <= 50 * 1048576);
+  for (const f of files) assert.ok(fs.statSync(f.out).size > 14e6, `${f.name} kept its quality`);
+  // the next pick: the big one alone keeps the full size
+  await page.click('#againBtn');
+  await page.setInputFiles('#file', [fx.big]);
+  await visible(page, 'done');
+  const [big] = await saveAll(page, 1, 'out-fit-big');
+  assert.ok(fs.statSync(big.out).size > 15e6 && fs.statSync(big.out).size <= 20e6, 'just under 20 MB');
   await ctx.close();
 });
-
 await test('one or two videos keep the full size', async () => {
   const { ctx, page } = await newPage({ init: chromeAndroidShare });
   await page.selectOption('#limit', '20');
