@@ -88,7 +88,7 @@ function environmentProblem() {
     if (/firefox|fxios/i.test(navigator.userAgent) && /android/i.test(navigator.userAgent)) {
       return "Firefox on Android can't do this. Open this page in Chrome.";
     }
-    return 'This browser does not support WebCodecs, which is needed to shrink video. Use iOS/iPadOS 16.4 or newer, or a current Chrome.';
+    return 'This browser does not support WebCodecs, which is needed to shrink video. If you opened this inside Discord, tap the menu and choose "Open in browser". Otherwise use iOS/iPadOS 16.4 or newer, or a current Chrome.';
   }
   return null;
 }
