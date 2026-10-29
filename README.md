@@ -24,6 +24,13 @@ Both serve HTTPS by default. There is no service worker, so there are no stale-c
 3. Mediabunny `Conversion` decodes and re-encodes with WebCodecs into a fast-start MP4 (H.264 + AAC). If the device cannot encode H.264 it uses the next codec it can (H.265, VP9, AV1) and says so. If the browser has no native AAC encoder, the vendored WASM AAC encoder is loaded.
 4. If the result is over the limit it is redone once with a lower bitrate; if still over, the real size is shown as an error.
 
+## Limits
+
+- One video at a time. No hard size or duration cap; the page shows a soft warning above 15 minutes, 1 GB (slow, screen must stay on) and 2 GB (picking may be slow), and for 4K or 4K60 sources. These thresholds are estimates, not documented limits.
+- Output limit: 10, 20 (default) or 50 MB, as chosen. Result is aimed at 93% of it.
+- Documented: WebCodecs needs iOS/iPadOS 16.4+ or Chrome on Android; Firefox on Android has none. iOS before 26 has no AudioDecoder, so the sound is dropped there (Mediabunny discards undecodable audio tracks).
+- Estimated: encode speed (roughly 0.5-2x realtime at 1080p on mid-range phones) and memory use (the result is held in memory, peak about 2x its size). Not tested on real phones.
+
 ## Dependencies
 
 Mediabunny and its AAC encoder are vendored in `vendor/` (see `vendor/README.md`, hashes in `vendor/SHA256SUMS`). Chosen over a hand-rolled approach because demuxing arbitrary phone files (MOV/MP4/HEVC, rotation, VFR) and muxing a correct fast-start MP4 is where dependency-free attempts break. An import map in `index.html` resolves the bare module names, so there is no bundler.

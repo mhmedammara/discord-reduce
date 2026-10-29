@@ -72,7 +72,10 @@ function releaseScreen() {
 document.addEventListener('visibilitychange', () => {
   if (!job) return;
   if (document.visibilityState === 'hidden') hiddenDuringJob = true;
-  else holdScreenOn();
+  else {
+    holdScreenOn();
+    if (hiddenDuringJob) $('workLabel').textContent = 'Shrinking... (it may have paused while the screen was off)';
+  }
 });
 
 // ---------- environment ----------
@@ -82,6 +85,9 @@ function environmentProblem() {
     return 'This page must be opened over HTTPS (or localhost). Video encoding is blocked on plain http:// pages.';
   }
   if (!('VideoEncoder' in window) || !('VideoDecoder' in window)) {
+    if (/firefox|fxios/i.test(navigator.userAgent) && /android/i.test(navigator.userAgent)) {
+      return "Firefox on Android can't do this. Open this page in Chrome.";
+    }
     return 'This browser does not support WebCodecs, which is needed to shrink video. Use iOS/iPadOS 16.4 or newer, or a current Chrome.';
   }
   return null;
@@ -96,24 +102,31 @@ async function inspect(file) {
     if (!video) throw new Error('unsupported: no video track');
     if (!(await video.canDecode())) throw new CannotDecodeError();
     const audio = await input.getPrimaryAudioTrack();
+    // Without an audio decoder (iOS before 26) the sound cannot be re-encoded, so it is dropped.
+    const audioOk = Boolean(audio) && await audio.canDecode();
     const stats = await video.computePacketStats(120);
     const width = await video.getDisplayWidth();
     const height = await video.getDisplayHeight();
+    const duration = await input.computeDuration();
+    const fps = Math.round(stats.averagePacketRate) || 30;
+    const notes = await sourceNotes(video, width, height, fps, duration, file.size);
     return {
-      notes: await sourceNotes(video, width, height),
+      notes: audio && !audioOk
+        ? `${notes} This device can't read this video's sound, so the result will have no audio.`.trim()
+        : notes,
       file,
-      duration: await input.computeDuration(),
+      duration,
       width,
       height,
-      fps: Math.round(stats.averagePacketRate) || 30,
-      hasAudio: Boolean(audio),
+      fps,
+      hasAudio: audioOk,
     };
   } finally {
     input.dispose();
   }
 }
 
-async function sourceNotes(video, width, height) {
+async function sourceNotes(video, width, height, fps, duration, size) {
   const notes = [];
   try {
     const transfer = (await video.getColorSpace?.())?.transfer;
@@ -122,8 +135,14 @@ async function sourceNotes(video, width, height) {
     }
   } catch { /* colour info is optional */ }
   if (Math.max(width, height) > 1920) {
-    notes.push('This is a large (4K) video. Long clips may run out of memory; trimming helps.');
+    notes.push('This is a 4K video. It will be slow; trimming helps.');
   }
+  if (width * height * fps > 3840 * 2160 * 30) notes.push('High frame rate at this size makes it slower still.');
+  if (duration > 900 || size > 1e9) {
+    notes.push('Long or large video: this can take several times the video length and needs the screen on. ' +
+      'Trimming to the part you need is much faster.');
+  }
+  if (size > 2e9) notes.push('Very large file: choosing it may take a while. Consider trimming in Photos first.');
   return notes.join(' ');
 }
 
@@ -256,6 +275,7 @@ async function runShrink() {
       setProgress(0);
       throwIfCancelled();
       const lower = { ...plan, videoBps: retryVideoBps(plan.videoBps, blob.size, limitMb) };
+      blob = null; // free the first result before the second encode
       blob = await encodeOnce(lower, codec, trim);
     }
     if (blob.size > limitBytes(limitMb)) {
