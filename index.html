@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Discord Video Shrinker</title>
+<script type="importmap">
+{ "imports": {
+  "mediabunny": "./vendor/mediabunny.min.mjs",
+  "@mediabunny/aac-encoder": "./vendor/mediabunny-aac-encoder.min.mjs"
+} }
+</script>
+<style>
+  :root { --bg:#14151a; --card:#1f2128; --line:#32353f; --text:#eceef3; --muted:#9aa0ae; --accent:#5865f2; --bad:#ff6b6b; --good:#4cd38a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:17px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         padding:16px max(16px, env(safe-area-inset-right)) 32px max(16px, env(safe-area-inset-left)); }
+  main { max-width:520px; margin:0 auto; display:grid; gap:14px; }
+  h1 { font-size:1.4rem; margin:4px 0 0; }
+  p { margin:0; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; display:grid; gap:10px; }
+  button, .btn, select, input[type=number] { font:inherit; color:var(--text); min-height:56px; border-radius:12px; border:1px solid var(--line); background:#2a2d37; padding:0 16px; width:100%; }
+  button { cursor:pointer; font-weight:600; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  label { display:grid; gap:6px; font-size:.9rem; color:var(--muted); }
+  progress { width:100%; height:18px; accent-color:var(--accent); }
+  video { width:100%; max-height:60vh; border-radius:12px; background:#000; }
+  .msg { border-radius:12px; padding:12px 14px; background:#3a1f24; border:1px solid var(--bad); }
+  .msg.warn { background:#2e2a17; border-color:#d9b44a; }
+  .ok { color:var(--good); font-weight:600; }
+  details summary { cursor:pointer; min-height:44px; display:flex; align-items:center; color:var(--muted); }
+  [hidden] { display:none !important; }
+  #file { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Discord Video Shrinker</h1>
+  <p class="muted">Shrinks one video to fit Discord's upload limit. Everything happens on your device; nothing is uploaded.</p>
+
+  <div id="fatal" class="msg" hidden></div>
+
+  <section id="pick" class="card">
+    <input id="file" type="file" accept="video/*">
+    <button id="choose" class="primary" type="button">Choose video</button>
+  </section>
+
+  <section id="setup" class="card" hidden>
+    <div><strong id="fileName"></strong></div>
+    <div class="muted" id="fileInfo"></div>
+    <label>Target size
+      <select id="limit">
+        <option value="10" selected>10 MB (safe for everyone)</option>
+        <option value="25">25 MB</option>
+        <option value="50">50 MB</option>
+      </select>
+    </label>
+    <p class="muted">Discord's limit depends on your account (and server boost level). 10 MB always works.</p>
+    <details id="trimBox">
+      <summary>Trim (optional)</summary>
+      <div class="row">
+        <label>Start (seconds)<input id="trimStart" type="number" min="0" step="0.1" inputmode="decimal" value="0"></label>
+        <label>End (seconds)<input id="trimEnd" type="number" min="0" step="0.1" inputmode="decimal"></label>
+      </div>
+    </details>
+    <div id="setupMsg" class="msg warn" hidden></div>
+    <button id="shrink" class="primary" type="button">Shrink</button>
+    <p class="muted">Keep this screen on and this tab open while it works.</p>
+  </section>
+
+  <section id="work" class="card" hidden>
+    <div id="workLabel">Shrinking...</div>
+    <progress id="bar" max="100" value="0"></progress>
+    <div id="pct" class="muted">0%</div>
+    <button id="cancel" type="button">Cancel</button>
+  </section>
+
+  <section id="result" class="card" hidden>
+    <video id="preview" controls playsinline></video>
+    <div id="resultInfo" class="ok"></div>
+    <div id="codecNote" class="msg warn" hidden></div>
+    <a id="download" class="btn" role="button" style="display:flex;align-items:center;justify-content:center;background:var(--accent);border-color:var(--accent);text-decoration:none;color:#fff;font-weight:600">Download</a>
+    <button id="share" type="button" hidden>Share</button>
+  </section>
+
+  <section id="failure" class="card" hidden>
+    <div id="failureMsg" class="msg"></div>
+  </section>
+
+  <button id="startOver" type="button" hidden>Start over</button>
+
+  <p class="muted">Location and other metadata from the original are not copied into the result.</p>
+</main>
+<script>
+  // If the module script could not run at all (old browser without import maps), say so.
+  window.addEventListener('load', function () {
+    if (window.__appReady) return;
+    var el = document.getElementById('fatal');
+    el.textContent = 'This browser is too old to run the shrinker. Use iOS/iPadOS 16.4 or newer, or a current Chrome.';
+    el.hidden = false;
+    document.getElementById('choose').disabled = true;
+  });
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

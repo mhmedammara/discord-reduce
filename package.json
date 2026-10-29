@@ -1,0 +1,10 @@
+{
+  "name": "discord-compressvid",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shrink one video to fit Discord's upload limit, entirely in the browser.",
+  "scripts": {
+    "test": "node --test"
+  }
+}
