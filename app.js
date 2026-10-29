@@ -38,9 +38,16 @@ function fail(text) {
   show('failure');
 }
 
+// Read the picked file in plain slices. Streaming it fails with "network error" on Android Chrome
+// for files handed over by the phone's file picker (content:// URIs, Google Photos).
+const FILE_READ_OPTIONS = { useStreamReader: false };
+
 function describeError(err) {
   if (err instanceof ConversionCanceledError) return 'Cancelled. Nothing was saved.';
   const text = String(err?.message ?? err);
+  if (/network error|NotReadableError|NotFoundError|could not be read/i.test(`${err?.name} ${text}`)) {
+    return `The phone couldn't read this video file (${err?.name ?? 'error'}: ${text}). If it is in Google Photos or the cloud, download it to the phone first, or pick it from Files or the Gallery, then try again.`;
+  }
   if (err instanceof RangeError || /memory|allocation|quota/i.test(text)) {
     return 'The phone ran out of memory. Close other apps and tabs, or trim the video to a shorter part, then try again.';
   }
@@ -96,7 +103,7 @@ function environmentProblem() {
 // ---------- reading the chosen file ----------
 
 async function inspect(file) {
-  const input = new Input({ source: new BlobSource(file), formats: ALL_FORMATS });
+  const input = new Input({ source: new BlobSource(file, FILE_READ_OPTIONS), formats: ALL_FORMATS });
   try {
     const video = await input.getPrimaryVideoTrack();
     if (!video) throw new Error('unsupported: no video track');
@@ -185,7 +192,7 @@ async function ensureAacEncoder() {
 }
 
 async function encodeOnce(plan, codec, trim) {
-  const input = new Input({ source: new BlobSource(source.file), formats: ALL_FORMATS });
+  const input = new Input({ source: new BlobSource(source.file, FILE_READ_OPTIONS), formats: ALL_FORMATS });
   const output = new Output({
     format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
     target: new BufferTarget(),
