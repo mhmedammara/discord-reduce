@@ -1,6 +1,6 @@
 # Discord Video Shrinker
 
-A static web page that shrinks ONE video so it fits Discord's upload limit (10, 25 or 50 MB). It runs entirely in the browser, built for iPhone Safari 16.4+ and Android Chrome. No server, no build step, nothing is uploaded. Location and other metadata are not copied into the result.
+A static web page that shrinks ONE video so it fits Discord's upload limit (20 MB free limit by default; 10 or 50 MB also available). It runs entirely in the browser, built for iPhone Safari 16.4+ and Android Chrome. No server, no build step, nothing is uploaded. Location and other metadata are not copied into the result.
 
 ## Run locally
 

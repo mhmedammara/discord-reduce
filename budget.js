@@ -1,6 +1,6 @@
 // Pure sizing math: no DOM, no I/O. Everything is in bits, bytes, seconds or pixels.
 
-export const LIMITS_MB = [10, 25, 50];
+export const LIMITS_MB = [10, 20, 50];
 export const SAFETY = 0.93; // aim ~7% under the chosen limit
 export const AUDIO_STEPS = [128000, 96000, 64000];
 
