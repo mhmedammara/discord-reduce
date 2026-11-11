@@ -6,6 +6,7 @@ import { planBudget, retryVideoBps, limitBytes } from './budget.js';
 
 const $ = (id) => document.getElementById(id);
 const SECTIONS = ['pick', 'setup', 'work', 'result', 'failure'];
+const APP_VERSION = 'v3';
 const CODEC_LABEL = { avc: 'H.264', hevc: 'H.265', vp9: 'VP9', av1: 'AV1' };
 
 let source = null; // { file, duration, width, height, fps, hasAudio }
@@ -56,7 +57,7 @@ function describeError(err) {
     return "The phone wouldn't let the browser read this video. This usually happens with videos that are only in " +
       'Google Photos or another cloud app. Tap "Choose from Files instead" below and pick it from Downloads, ' +
       'Camera or Movies, or open Google Photos, tap \u22ee then Download, and try again. ' +
-      `(${err?.name ?? 'error'}: ${text})`;
+      `(${err?.name ?? 'error'}: ${text}${copyLog ? `; ${copyLog}` : ''}; ${APP_VERSION})`;
   }
   if (err instanceof RangeError || /memory|allocation|quota/i.test(text)) {
     return 'The phone ran out of memory. Close other apps and tabs, or trim the video to a shorter part, then try again.';
@@ -116,19 +117,31 @@ function environmentProblem() {
 // Those reads can fail at random with NotReadableError, and encoding reads the file many times over.
 // So the file is read once, in order and with retries, into the page's private storage, and all later
 // work reads that copy. Where the browser can't write private storage (older Safari) the original is used.
-const COPY_NAME = 'picked-video';
+const COPY_PREFIX = 'picked-video-';
+const COPY_NAME = `${COPY_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // one per tab
 const COPY_CHUNK = 4 * 1024 * 1024;
-const READ_RETRY_WAITS = [0, 300, 1000, 2500];
+// Slices get a few quick retries; then the file is read as a stream, which is retried for about half
+// a minute in all, because long videos may still be downloading (Google Photos) or converting (Android).
+const SLICE_RETRY_WAITS = [0, 500, 1500];
+const STREAM_RETRY_WAITS = [0, 1000, 2000, 4000, 8000, 15000];
+const STALE_COPY_MS = 6 * 60 * 60 * 1000;
 let copying = null; // { cancelled }
+let copyLog = ''; // shown with read errors, to tell where reading broke
 
 class CopyCancelled extends Error {}
 
-async function readSlice(file, start, end) {
+const mb = (bytes) => `${Math.round(bytes / 1e6)} MB`;
+
+async function withRetries(read, onWait, waits = SLICE_RETRY_WAITS) {
   let lastErr;
-  for (const wait of READ_RETRY_WAITS) {
-    if (wait) await sleep(wait);
+  for (const [i, wait] of waits.entries()) {
+    if (wait) {
+      onWait?.(i);
+      await sleep(wait);
+    }
+    if (copying?.cancelled) throw new CopyCancelled();
     try {
-      return await file.slice(start, end).arrayBuffer();
+      return await read();
     } catch (err) {
       lastErr = err;
     }
@@ -156,60 +169,102 @@ async function openCopyWriter() {
   }
 }
 
-async function copyBySlices(file, writable, onProgress) {
-  for (let pos = 0; pos < file.size; pos += COPY_CHUNK) {
-    if (copying?.cancelled) throw new CopyCancelled();
-    const end = Math.min(file.size, pos + COPY_CHUNK);
-    await writable.write(await readSlice(file, pos, end));
-    onProgress(end / file.size);
-  }
+function waitLabel() {
+  $('workLabel').textContent = 'Waiting for the phone to hand over the video... (long videos can take a while)';
 }
 
-async function copyByStream(file, writable, onProgress) {
-  const reader = file.stream().getReader();
-  let done = 0;
-  for (;;) {
-    if (copying?.cancelled) {
-      reader.cancel().catch(() => {});
-      throw new CopyCancelled();
+// Read [from, size) in slices. Returns the number of bytes written; throws with err.copied set.
+async function copyBySlices(file, writable, from, onProgress) {
+  let pos = from;
+  try {
+    while (pos < file.size) {
+      if (copying?.cancelled) throw new CopyCancelled();
+      const end = Math.min(file.size, pos + COPY_CHUNK);
+      const buf = await withRetries(() => file.slice(pos, end).arrayBuffer(), waitLabel);
+      $('workLabel').textContent = 'Getting the video ready...';
+      await writable.write(buf);
+      pos = end;
+      onProgress(pos / file.size);
     }
-    const { value, done: finished } = await reader.read();
-    if (finished) break;
-    await writable.write(value);
-    done += value.byteLength;
-    onProgress(done / file.size);
+  } catch (err) {
+    err.copied = pos;
+    throw err;
   }
+  return pos;
+}
+
+// Read the whole file in order from the start, skipping what is already written. Some phones only
+// hand over long videos as a one-way stream, which this can read when slices can't.
+async function copyByStream(file, writable, from, onProgress) {
+  let seen = 0;
+  let pos = from;
+  let reader = null;
+  try {
+    reader = file.stream().getReader();
+    for (;;) {
+      if (copying?.cancelled) throw new CopyCancelled();
+      const { value, done } = await reader.read();
+      if (done) break;
+      const start = seen;
+      seen += value.byteLength;
+      if (seen <= pos) continue;
+      await writable.write(start >= pos ? value : value.subarray(pos - start));
+      pos = seen;
+      onProgress(Math.min(1, pos / file.size));
+    }
+  } catch (err) {
+    reader?.cancel().catch(() => {});
+    err.copied = pos;
+    throw err;
+  }
+  return pos;
 }
 
 async function makeLocalCopy(file, onProgress) {
-  let firstErr = null;
-  for (const copy of [copyBySlices, copyByStream]) {
-    const target = await openCopyWriter();
-    if (!target) {
-      // No private storage to write to: check the start can be read, then use the original.
-      await readSlice(file, 0, Math.min(file.size, 65536));
+  copyLog = `${mb(file.size)} ${file.type || 'unknown type'}`;
+  const target = await openCopyWriter();
+  if (!target) {
+    // No private storage to write to: check the start can be read, then use the original.
+    copyLog += ', no private storage';
+    await withRetries(() => file.slice(0, Math.min(file.size, 65536)).arrayBuffer(), waitLabel);
+    return file;
+  }
+  const { handle, writable } = target;
+  let pos = 0;
+  try {
+    try {
+      pos = await copyBySlices(file, writable, 0, onProgress);
+    } catch (err) {
+      if (err instanceof CopyCancelled || err?.name === 'QuotaExceededError') throw err;
+      pos = err.copied ?? 0;
+      copyLog += `, slices stopped at ${mb(pos)} (${err?.name})`;
+      if (!file.stream) throw err;
+      $('workLabel').textContent = 'Getting the video ready (second way)...';
+      pos = await withRetries(async () => {
+        try {
+          return await copyByStream(file, writable, pos, onProgress);
+        } catch (e) {
+          if (e.copied > pos) pos = e.copied; // keep what arrived; the next try continues from there
+          throw e;
+        }
+      }, waitLabel, STREAM_RETRY_WAITS);
+    }
+    await writable.close();
+    const local = await handle.getFile();
+    if (!local.size && file.size) throw new DOMException('the copy came out empty', 'NotReadableError');
+    return local;
+  } catch (err) {
+    await writable.abort?.().catch(() => {});
+    await removeLocalCopy();
+    if (err instanceof CopyCancelled) throw err;
+    if (err?.name === 'QuotaExceededError') {
+      // Not enough free space for a copy: read the original directly instead.
+      copyLog += ', not enough space for a copy';
       return file;
     }
-    try {
-      await copy(file, target.writable, onProgress);
-      await target.writable.close();
-      const local = await target.handle.getFile();
-      if (!local.size && file.size) throw new Error('NotReadableError: the copy came out empty');
-      return local;
-    } catch (err) {
-      await target.writable.abort?.().catch(() => {});
-      if (err instanceof CopyCancelled) throw err;
-      // Not enough free space for a copy: fall back to reading the original directly.
-      if (err?.name === 'QuotaExceededError') {
-        await removeLocalCopy();
-        return file;
-      }
-      firstErr ??= err;
-      onProgress(0);
-    }
+    if (err?.copied !== undefined) copyLog += `, stream stopped at ${mb(err.copied)} (${err?.name})`;
+    throw err;
   }
-  await removeLocalCopy();
-  throw firstErr;
 }
 
 let removing = Promise.resolve();
@@ -222,6 +277,22 @@ function removeLocalCopy() {
   });
   return removing;
 }
+
+// Copies are per tab, so only clear ones old enough that no tab can still be using them.
+async function removeStaleCopies() {
+  try {
+    const dir = await privateDir();
+    if (!dir?.entries) return;
+    for await (const [name] of dir.entries()) {
+      const made = Number(name.startsWith(COPY_PREFIX) && name.slice(COPY_PREFIX.length).split('-')[0]);
+      if ((made && Date.now() - made > STALE_COPY_MS) || name === 'picked-video') {
+        await dir.removeEntry(name).catch(() => {});
+      }
+    }
+  } catch { /* best effort */ }
+}
+
+window.addEventListener('pagehide', () => { if (!job && !copying) removeLocalCopy(); });
 
 // ---------- reading the chosen file ----------
 
@@ -282,6 +353,7 @@ class NoEncoderError extends Error {}
 async function onFileChosen(file) {
   setMessage($('setupMsg'), '');
   source = null;
+  copyLog = '';
   copying = { cancelled: false };
   $('cancel').disabled = false;
   $('workLabel').textContent = 'Getting the video ready...';
@@ -510,7 +582,8 @@ function init() {
     job.conversion?.cancel();
   };
   $('startOver').onclick = startOver;
-  removeLocalCopy(); // a copy left over from an earlier visit
+  removeStaleCopies();
+  $('version').textContent = APP_VERSION;
   show('pick');
 }
 
