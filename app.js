@@ -6,7 +6,7 @@ import { planBudget, retryVideoBps, limitBytes } from './budget.js';
 
 const $ = (id) => document.getElementById(id);
 const SECTIONS = ['pick', 'setup', 'work', 'result', 'failure'];
-const APP_VERSION = 'v3';
+const APP_VERSION = 'v4';
 const CODEC_LABEL = { avc: 'H.264', hevc: 'H.265', vp9: 'VP9', av1: 'AV1' };
 
 let source = null; // { file, duration, width, height, fps, hasAudio }
@@ -47,7 +47,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const FILE_READ_OPTIONS = { useStreamReader: false };
 
 function isReadError(err) {
-  return /network error|NotReadableError|NotFoundError|could not be read/i.test(`${err?.name} ${err?.message ?? err}`);
+  return /network error|NotReadableError|NotFoundError|TimeoutError|could not be read/i.test(`${err?.name} ${err?.message ?? err}`);
 }
 
 function describeError(err) {
@@ -120,33 +120,35 @@ function environmentProblem() {
 const COPY_PREFIX = 'picked-video-';
 const COPY_NAME = `${COPY_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; // one per tab
 const COPY_CHUNK = 4 * 1024 * 1024;
-// Slices get a few quick retries; then the file is read as a stream, which is retried for about half
-// a minute in all, because long videos may still be downloading (Google Photos) or converting (Android).
-const SLICE_RETRY_WAITS = [0, 500, 1500];
-const STREAM_RETRY_WAITS = [0, 1000, 2000, 4000, 8000, 15000];
+// A read that fails is tried again, switching between reading in slices and reading as a stream, always
+// continuing from where it stopped. Long videos may still be downloading (Google Photos) or converting
+// (Android) when picked, so it only gives up after a long time with no new data at all.
+const READ_TIMEOUT_MS = 20000; // a single read that takes longer than this counts as failed
+const STALL_LIMIT_MS = 90000; // give up after this long without any new data
 const STALE_COPY_MS = 6 * 60 * 60 * 1000;
-let copying = null; // { cancelled }
+let copying = null; // { cancelled, lastGain: last new data, lastActivity: last data of any kind }
 let copyLog = ''; // shown with read errors, to tell where reading broke
 
 class CopyCancelled extends Error {}
+class StreamEnded extends Error {}
 
 const mb = (bytes) => `${Math.round(bytes / 1e6)} MB`;
 
-async function withRetries(read, onWait, waits = SLICE_RETRY_WAITS) {
-  let lastErr;
-  for (const [i, wait] of waits.entries()) {
-    if (wait) {
-      onWait?.(i);
-      await sleep(wait);
-    }
-    if (copying?.cancelled) throw new CopyCancelled();
-    try {
-      return await read();
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr;
+function withTimeout(promise, ms, onTimeout) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        onTimeout?.();
+        reject(new DOMException(`no data for ${ms / 1000} seconds`, 'TimeoutError'));
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+function checkCancelled() {
+  if (copying?.cancelled) throw new CopyCancelled();
 }
 
 async function privateDir() {
@@ -169,22 +171,24 @@ async function openCopyWriter() {
   }
 }
 
-function waitLabel() {
-  $('workLabel').textContent = 'Waiting for the phone to hand over the video... (long videos can take a while)';
+function gained(onProgress, pos, size) {
+  if (copying) copying.lastGain = copying.lastActivity = Date.now();
+  $('workLabel').textContent = 'Getting the video ready...';
+  onProgress(pos / size);
 }
 
-// Read [from, size) in slices. Returns the number of bytes written; throws with err.copied set.
+// Read [from, size) in slices. Returns the new position; a thrown error carries err.copied.
 async function copyBySlices(file, writable, from, onProgress) {
   let pos = from;
   try {
     while (pos < file.size) {
-      if (copying?.cancelled) throw new CopyCancelled();
+      checkCancelled();
       const end = Math.min(file.size, pos + COPY_CHUNK);
-      const buf = await withRetries(() => file.slice(pos, end).arrayBuffer(), waitLabel);
-      $('workLabel').textContent = 'Getting the video ready...';
+      const buf = await withTimeout(file.slice(pos, end).arrayBuffer(), READ_TIMEOUT_MS);
+      checkCancelled();
       await writable.write(buf);
       pos = end;
-      onProgress(pos / file.size);
+      gained(onProgress, pos, file.size);
     }
   } catch (err) {
     err.copied = pos;
@@ -193,8 +197,9 @@ async function copyBySlices(file, writable, from, onProgress) {
   return pos;
 }
 
-// Read the whole file in order from the start, skipping what is already written. Some phones only
-// hand over long videos as a one-way stream, which this can read when slices can't.
+// Read the file in order from the start, skipping what is already written. Some phones only hand over
+// long videos as a one-way stream, which this can read when slices can't. If the stream ends before
+// the size the phone reported, the video is simply shorter than reported, so StreamEnded is thrown.
 async function copyByStream(file, writable, from, onProgress) {
   let seen = 0;
   let pos = from;
@@ -202,22 +207,36 @@ async function copyByStream(file, writable, from, onProgress) {
   try {
     reader = file.stream().getReader();
     for (;;) {
-      if (copying?.cancelled) throw new CopyCancelled();
-      const { value, done } = await reader.read();
+      checkCancelled();
+      const { value, done } = await withTimeout(reader.read(), READ_TIMEOUT_MS);
       if (done) break;
       const start = seen;
       seen += value.byteLength;
-      if (seen <= pos) continue;
+      if (seen <= pos) {
+        $('workLabel').textContent = `Catching up to where reading stopped... ${Math.floor((seen / pos) * 100)}%`;
+        if (copying) copying.lastActivity = Date.now(); // busy, but not new data
+        continue;
+      }
       await writable.write(start >= pos ? value : value.subarray(pos - start));
       pos = seen;
-      onProgress(Math.min(1, pos / file.size));
+      gained(onProgress, Math.min(pos, file.size), file.size);
     }
   } catch (err) {
     reader?.cancel().catch(() => {});
     err.copied = pos;
     throw err;
   }
+  if (pos < file.size) throw Object.assign(new StreamEnded(), { copied: pos });
   return pos;
+}
+
+// Waits, showing how long it has been since data last arrived; resolves early on cancel.
+async function waitForPhone(ms) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    checkCancelled();
+    await sleep(Math.min(500, until - Date.now()));
+  }
 }
 
 async function makeLocalCopy(file, onProgress) {
@@ -226,28 +245,39 @@ async function makeLocalCopy(file, onProgress) {
   if (!target) {
     // No private storage to write to: check the start can be read, then use the original.
     copyLog += ', no private storage';
-    await withRetries(() => file.slice(0, Math.min(file.size, 65536)).arrayBuffer(), waitLabel);
+    await withTimeout(file.slice(0, Math.min(file.size, 65536)).arrayBuffer(), READ_TIMEOUT_MS);
     return file;
   }
   const { handle, writable } = target;
   let pos = 0;
+  let tries = 0;
+  const failures = [];
+  copying.lastGain = copying.lastActivity = Date.now();
   try {
-    try {
-      pos = await copyBySlices(file, writable, 0, onProgress);
-    } catch (err) {
-      if (err instanceof CopyCancelled || err?.name === 'QuotaExceededError') throw err;
-      pos = err.copied ?? 0;
-      copyLog += `, slices stopped at ${mb(pos)} (${err?.name})`;
-      if (!file.stream) throw err;
-      $('workLabel').textContent = 'Getting the video ready (second way)...';
-      pos = await withRetries(async () => {
-        try {
-          return await copyByStream(file, writable, pos, onProgress);
-        } catch (e) {
-          if (e.copied > pos) pos = e.copied; // keep what arrived; the next try continues from there
-          throw e;
+    while (pos < file.size) {
+      // Two slice attempts, then one stream attempt, repeated.
+      const useStream = tries % 3 === 2 && Boolean(file.stream);
+      tries += 1;
+      try {
+        pos = await (useStream ? copyByStream : copyBySlices)(file, writable, pos, onProgress);
+      } catch (err) {
+        if (err instanceof StreamEnded) {
+          copyLog += `, video ended at ${mb(err.copied)} of the reported ${mb(file.size)}`;
+          pos = err.copied;
+          break;
         }
-      }, waitLabel, STREAM_RETRY_WAITS);
+        if (err instanceof CopyCancelled || err?.name === 'QuotaExceededError') throw err;
+        if (err.copied > pos) pos = err.copied;
+        // A slice that never answered won't do better next time: go to the stream straight away.
+        if (!useStream && err?.name === 'TimeoutError') tries = Math.ceil((tries + 1) / 3) * 3 - 1;
+        const note = `${useStream ? 'stream' : 'slices'} stopped at ${mb(pos)} (${err?.name})`;
+        if (failures.at(-1) !== note) failures.push(note);
+        if (Date.now() - copying.lastGain > STALL_LIMIT_MS) {
+          copyLog += `, ${failures.slice(-4).join(', ')}, gave up after ${STALL_LIMIT_MS / 1000}s with no new data`;
+          throw err;
+        }
+        await waitForPhone(Math.min(1000 * tries, 5000));
+      }
     }
     await writable.close();
     const local = await handle.getFile();
@@ -262,7 +292,6 @@ async function makeLocalCopy(file, onProgress) {
       copyLog += ', not enough space for a copy';
       return file;
     }
-    if (err?.copied !== undefined) copyLog += `, stream stopped at ${mb(err.copied)} (${err?.name})`;
     throw err;
   }
 }
@@ -354,7 +383,15 @@ async function onFileChosen(file) {
   setMessage($('setupMsg'), '');
   source = null;
   copyLog = '';
-  copying = { cancelled: false };
+  copying = { cancelled: false, lastGain: Date.now(), lastActivity: Date.now() };
+  // While no data arrives, say so and count the seconds, so a slow phone doesn't look frozen.
+  const ticker = setInterval(() => {
+    const quiet = copying ? Math.floor((Date.now() - copying.lastActivity) / 1000) : 0;
+    if (quiet >= 3) {
+      $('workLabel').textContent = `Waiting for the phone to hand over the video... ${quiet}s ` +
+        `(gives up after ${STALL_LIMIT_MS / 1000}s; videos picked from Files usually don't need to wait)`;
+    }
+  }, 1000);
   $('cancel').disabled = false;
   $('workLabel').textContent = 'Getting the video ready...';
   setProgress(0);
@@ -375,6 +412,7 @@ async function onFileChosen(file) {
     }
     return;
   } finally {
+    clearInterval(ticker);
     copying = null;
   }
   $('fileName').textContent = file.name;
