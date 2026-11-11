@@ -33,20 +33,30 @@ function setMessage(el, text) {
   el.hidden = !text;
 }
 
-function fail(text) {
+function fail(text, offerFiles = false) {
   $('failureMsg').textContent = text;
+  $('chooseFiles').hidden = !offerFiles;
   show('failure');
 }
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Read the picked file in plain slices. Streaming it fails with "network error" on Android Chrome
 // for files handed over by the phone's file picker (content:// URIs, Google Photos).
 const FILE_READ_OPTIONS = { useStreamReader: false };
 
+function isReadError(err) {
+  return /network error|NotReadableError|NotFoundError|could not be read/i.test(`${err?.name} ${err?.message ?? err}`);
+}
+
 function describeError(err) {
   if (err instanceof ConversionCanceledError) return 'Cancelled. Nothing was saved.';
   const text = String(err?.message ?? err);
-  if (/network error|NotReadableError|NotFoundError|could not be read/i.test(`${err?.name} ${text}`)) {
-    return `The phone couldn't read this video file (${err?.name ?? 'error'}: ${text}). If it is in Google Photos or the cloud, download it to the phone first, or pick it from Files or the Gallery, then try again.`;
+  if (isReadError(err)) {
+    return "The phone wouldn't let the browser read this video. This usually happens with videos that are only in " +
+      'Google Photos or another cloud app. Tap "Choose from Files instead" below and pick it from Downloads, ' +
+      'Camera or Movies, or open Google Photos, tap \u22ee then Download, and try again. ' +
+      `(${err?.name ?? 'error'}: ${text})`;
   }
   if (err instanceof RangeError || /memory|allocation|quota/i.test(text)) {
     return 'The phone ran out of memory. Close other apps and tabs, or trim the video to a shorter part, then try again.';
@@ -98,6 +108,119 @@ function environmentProblem() {
     return 'This browser does not support WebCodecs, which is needed to shrink video. If you opened this inside Discord, tap the menu and choose "Open in browser". Otherwise use iOS/iPadOS 16.4 or newer, or a current Chrome.';
   }
   return null;
+}
+
+// ---------- making a local copy of the chosen file ----------
+
+// On Android the picked file is a lazy handle to the phone's content provider (photo picker, Google Photos).
+// Those reads can fail at random with NotReadableError, and encoding reads the file many times over.
+// So the file is read once, in order and with retries, into the page's private storage, and all later
+// work reads that copy. Where the browser can't write private storage (older Safari) the original is used.
+const COPY_NAME = 'picked-video';
+const COPY_CHUNK = 4 * 1024 * 1024;
+const READ_RETRY_WAITS = [0, 300, 1000, 2500];
+let copying = null; // { cancelled }
+
+class CopyCancelled extends Error {}
+
+async function readSlice(file, start, end) {
+  let lastErr;
+  for (const wait of READ_RETRY_WAITS) {
+    if (wait) await sleep(wait);
+    try {
+      return await file.slice(start, end).arrayBuffer();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
+async function privateDir() {
+  try {
+    return await navigator.storage.getDirectory();
+  } catch {
+    return null;
+  }
+}
+
+async function openCopyWriter() {
+  await removing; // never write while an old copy is still being deleted
+  try {
+    const dir = await privateDir();
+    const handle = await dir?.getFileHandle(COPY_NAME, { create: true });
+    const writable = await handle?.createWritable?.();
+    return writable ? { handle, writable } : null;
+  } catch {
+    return null;
+  }
+}
+
+async function copyBySlices(file, writable, onProgress) {
+  for (let pos = 0; pos < file.size; pos += COPY_CHUNK) {
+    if (copying?.cancelled) throw new CopyCancelled();
+    const end = Math.min(file.size, pos + COPY_CHUNK);
+    await writable.write(await readSlice(file, pos, end));
+    onProgress(end / file.size);
+  }
+}
+
+async function copyByStream(file, writable, onProgress) {
+  const reader = file.stream().getReader();
+  let done = 0;
+  for (;;) {
+    if (copying?.cancelled) {
+      reader.cancel().catch(() => {});
+      throw new CopyCancelled();
+    }
+    const { value, done: finished } = await reader.read();
+    if (finished) break;
+    await writable.write(value);
+    done += value.byteLength;
+    onProgress(done / file.size);
+  }
+}
+
+async function makeLocalCopy(file, onProgress) {
+  let firstErr = null;
+  for (const copy of [copyBySlices, copyByStream]) {
+    const target = await openCopyWriter();
+    if (!target) {
+      // No private storage to write to: check the start can be read, then use the original.
+      await readSlice(file, 0, Math.min(file.size, 65536));
+      return file;
+    }
+    try {
+      await copy(file, target.writable, onProgress);
+      await target.writable.close();
+      const local = await target.handle.getFile();
+      if (!local.size && file.size) throw new Error('NotReadableError: the copy came out empty');
+      return local;
+    } catch (err) {
+      await target.writable.abort?.().catch(() => {});
+      if (err instanceof CopyCancelled) throw err;
+      // Not enough free space for a copy: fall back to reading the original directly.
+      if (err?.name === 'QuotaExceededError') {
+        await removeLocalCopy();
+        return file;
+      }
+      firstErr ??= err;
+      onProgress(0);
+    }
+  }
+  await removeLocalCopy();
+  throw firstErr;
+}
+
+let removing = Promise.resolve();
+
+function removeLocalCopy() {
+  removing = removing.then(async () => {
+    try {
+      await (await privateDir())?.removeEntry(COPY_NAME);
+    } catch { /* nothing to remove */ }
+  });
+  return removing;
 }
 
 // ---------- reading the chosen file ----------
@@ -158,13 +281,29 @@ class NoEncoderError extends Error {}
 
 async function onFileChosen(file) {
   setMessage($('setupMsg'), '');
+  source = null;
+  copying = { cancelled: false };
+  $('cancel').disabled = false;
+  $('workLabel').textContent = 'Getting the video ready...';
+  setProgress(0);
+  show('work');
   try {
-    source = await inspect(file);
+    const data = await makeLocalCopy(file, setProgress);
+    source = await inspect(data);
+    source.name = file.name;
   } catch (err) {
-    fail(err instanceof CannotDecodeError
-      ? "This phone can't decode this video's format. Try a video recorded with the normal camera app."
-      : describeError(err));
+    if (err instanceof CopyCancelled) {
+      startOver();
+      return;
+    }
+    if (err instanceof CannotDecodeError) {
+      fail("This phone can't decode this video's format. Try a video recorded with the normal camera app.");
+    } else {
+      fail(describeError(err), isReadError(err));
+    }
     return;
+  } finally {
+    copying = null;
   }
   $('fileName').textContent = file.name;
   $('fileInfo').textContent = `${fmtMb(file.size)}, ${fmtTime(source.duration)}, ${source.width}x${source.height}`;
@@ -292,7 +431,7 @@ async function runShrink() {
     }
     showResult(blob, codec, limitMb);
   } catch (err) {
-    fail(describeError(err));
+    fail(describeError(err), isReadError(err));
   } finally {
     job = null;
     releaseScreen();
@@ -302,7 +441,7 @@ async function runShrink() {
 // ---------- result ----------
 
 function showResult(blob, codec, limitMb) {
-  const name = source.file.name.replace(/\.[^.]+$/, '') + '-discord.mp4';
+  const name = source.name.replace(/\.[^.]+$/, '') + '-discord.mp4';
   resultUrl = URL.createObjectURL(blob);
   $('preview').src = resultUrl;
   $('download').href = resultUrl;
@@ -330,6 +469,7 @@ function startOver() {
   $('preview').removeAttribute('src');
   $('file').value = '';
   source = null;
+  removeLocalCopy();
   show('pick');
 }
 
@@ -343,12 +483,26 @@ function init() {
     return;
   }
   $('choose').onclick = () => $('file').click();
+  // The plain file chooser (no video filter) opens Android's Files app instead of the photo picker,
+  // which hands over a real file and avoids Google Photos' cloud copies.
+  $('chooseFiles').onclick = () => {
+    $('file').removeAttribute('accept');
+    $('file').value = '';
+    $('file').click();
+  };
   $('file').onchange = (e) => {
     const file = e.target.files[0];
+    $('file').setAttribute('accept', 'video/*');
     if (file) onFileChosen(file);
   };
   $('shrink').onclick = runShrink;
   $('cancel').onclick = () => {
+    if (copying) {
+      copying.cancelled = true;
+      $('cancel').disabled = true;
+      $('workLabel').textContent = 'Cancelling...';
+      return;
+    }
     if (!job) return;
     job.cancelled = true;
     $('cancel').disabled = true;
@@ -356,6 +510,7 @@ function init() {
     job.conversion?.cancel();
   };
   $('startOver').onclick = startOver;
+  removeLocalCopy(); // a copy left over from an earlier visit
   show('pick');
 }
 

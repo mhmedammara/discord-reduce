@@ -19,7 +19,7 @@ Both serve HTTPS by default. There is no service worker, so there are no stale-c
 
 ## How it works
 
-1. `Input` + `BlobSource` (Mediabunny) reads the file lazily; duration, size, frame rate and audio presence are probed.
+1. The picked file is first copied, in order and with retries, into the browser's private storage (OPFS), because Android's photo picker / Google Photos hands over a lazy file whose reads can fail with `NotReadableError`. Without writable OPFS (older Safari) the original file is used. If reading still fails, the error screen offers "Choose from Files instead", which opens the plain file chooser rather than the photo picker. `Input` + `BlobSource` (Mediabunny) then reads the copy lazily; duration, size, frame rate and audio presence are probed.
 2. `budget.js` (pure, unit-tested) turns duration + limit into video bitrate, resolution (short side 1080/720/540/480/360, never upscaled, even dimensions) and fps (max 30). Target is 93% of the limit. Audio is 128 kbps, dropping to 96/64 only when the video would otherwise be unwatchable. If it still cannot be watchable, the page shows the longest duration that works and pre-fills a trim range.
 3. Mediabunny `Conversion` decodes and re-encodes with WebCodecs into a fast-start MP4 (H.264 + AAC). If the device cannot encode H.264 it uses the next codec it can (H.265, VP9, AV1) and says so. If the browser has no native AAC encoder, the vendored WASM AAC encoder is loaded.
 4. If the result is over the limit it is redone once with a lower bitrate; if still over, the real size is shown as an error.
